@@ -31,8 +31,9 @@
 已导出如下功能：
 - OTP（TOTP / HOTP / mOTP / Yandex OTP / Steam Guard）
 - 保险库
-- 分组与排序
-- 导入与导出
+- 树状分组（父子关系、条目与子分组的混合顺序）
+- 导入与导出（六种格式，含两个 `.q2fa` 容器）
+- 图标（随条目过边界，字节原样）
 - 恢复密钥
 - 注册/登录
 - 挑战-应答与同步
@@ -130,10 +131,11 @@ val code = totpCode(entry.secretBase32, System.currentTimeMillis() / 1000, entry
 | `removeEntry(id, now)` → `Bool`                             | 删除（留墓碑）                              |
 | `serialize`                                                 | 序列化，供端侧**原子地**落盘                |
 | `codeFor(id, now)` / `hotpFor(id, counter)`                 | 按**条目的种类**算验证码                    |
-| `groups` / `groupOf(id)`                                    | 分组与它们的排序（顶分组永远在第一个）      |
-| `createGroup` / `renameGroup` / `moveGroup` / `removeGroup` | 分组的增删改名与排序（删组不删条目）        |
-| `setOrdering` / `assignToGroup`                             | 写排序（整份列表）与把条目移进某个分组      |
-| `export(format, password)`                                  | 导出成别人的认证器能读的格式（见下）        |
+| `groups` / `childrenOf(id)` / `parentOf(id)` / `depthOf(id)` | 树本身：前序的组列表、某组的子节点、父与深度（顶分组永远是第一个） |
+| `createGroupIn` / `renameGroup` / `setChildren` / `removeGroup` | 新建到指定父、改名、写一整条子节点列表、删除（子节点移到父分组） |
+| `setOrdering` / `assignToGroup`                             | 只重排某组里的条目，以及把条目移进某个分组（`setChildren` 的子集用法） |
+| `export(format, password)`                                  | 导出六种格式之一（两个 `.q2fa` 容器 + 四种外部格式） |
+| `detectPortableFile` / `openPortableFile` / `FfiPortableRestore` | 识别并恢复 `.q2fa`（含旧 key-only 文件），失败时回滚主密钥 |
 | `exportRecoveryKey(passphrase, …)`                          | 导出恢复密钥文件                            |
 
 `updateEntry` 与 `removeEntry` 的区别不只是语义：修改保留条目标识，删除留下墓碑。
@@ -153,13 +155,16 @@ val code = totpCode(entry.secretBase32, System.currentTimeMillis() / 1000, entry
 ### 导出（`FfiVault.export`）
 
 `vault.export(format, password)` 写出整份保险库并返回文件字节：**本层不做 I/O**，写到哪里由端侧
-的保存对话框决定。四种格式与导入一一对应：`Text`（每行一个 URI）、`Json`、`EncryptedJson`、
-`Html`（每个条目画一张二维码）。界面在选格式时要问的三件事各有一个函数：`exportFormatNeedsPassword`
-（要不要口令）、`exportFormatExtension`（文件叫什么）、`exportFormatCarriesGroups`
-（分组与排序能不能带过去——**只有两种 JSON 能**）。
+的保存对话框决定。六种格式分两类：两个 `.q2fa` 容器（`Vault` 主密钥明文、`EncryptedVault`
+口令包裹）能完整恢复账号（条目、分组树、图标）；`Text`（每行一个 URI）、`Json`、
+`EncryptedJson`、`Html`（每个条目画一张二维码）是别的认证器读的，只有 JSON 带得走图标与
+扁平的组名。界面在选格式时要问的四件事各有一个函数：`exportFormatNeedsPassword`、
+`exportFormatExtension`、`exportFormatCarriesGroups` 与 `exportFormatGroupCarrying`
+（`None` / `FlatGroups` / `FullTree`）。
 
-**只有 `EncryptedJson` 保护任何东西。** 另外三种与保险库本身一样敏感：明文种子就在里面，
-`Html` 每张二维码里就是那条目的 `otpauth://` URI（含密钥）。写文件之前界面必须把这件事说清楚。
+**只有 `EncryptedJson` 与 `EncryptedVault` 保护任何东西。** `Vault` 把主密钥明文放在文件里；
+其余明文格式与保险库本身一样敏感：明文种子就在里面，`Html` 每张二维码里就是那条目的
+`otpauth://` URI（含密钥）。写文件之前界面必须把这件事说清楚。
 
 **空口令会被拒绝**（`export_password_empty`），它等于谁都能打开。加密走格式自己的两段式：
 scrypt 导出槽密钥、槽里放随机主密钥、主密钥用 AES-256-GCM 加密数据库，所有随机值都来自 OS CSPRNG。
@@ -370,6 +375,15 @@ session.send(channel.transport(), FfiRecipient.One(peer.deviceId), FfiPayloadKin
 > 报告的是**听到的**对端。两者不是同一个集合：要让一台设备能收到消息，先把它从大厅
 > 登记进来。公告本身**不认证**——它只回答「这个网段上大概有谁、去哪里找他」，真的身份
 > 由连接握手证明，载荷该不该收由核心按设备标识判断。
+
+### 0.3.0 的破坏性变更
+
+- **依赖 `qualia2fa-core 0.3.0`**：保险库格式 **4**、同步载荷 **4**，与 0.2.x **无法同步**；
+  旧保险库照旧能读，旧端的版本错误是明确的。
+- **分组变成树**：`FfiGroup` 不再有 `order`，多出 `children`（`FfiGroupChild`：条目 / 分组）；
+  `moveGroup` 被 `setChildren` / `createGroupIn` 取代。冲突里的 `local` / `incoming` 也换成子节点列表。
+- **条目多出 `icon`**（`FfiEntryIcon`：格式 + 原始字节），导出入口多出两个 `.q2fa` 格式与
+  `FfiGroupCarrying`。
 
 ### 0.2.0 的破坏性变更
 

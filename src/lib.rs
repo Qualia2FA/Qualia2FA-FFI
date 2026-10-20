@@ -84,7 +84,7 @@ use qualia2fa_core::transport::{
     Recipient, Roster, SharePlan, SyncSession, Transport, TransportCapabilities,
 };
 use qualia2fa_core::uri;
-use qualia2fa_core::vault::{Entry, EntryKind, Group, MasterKey, Vault, VaultFile};
+use qualia2fa_core::vault::{Entry, EntryKind, Group, GroupChild, MasterKey, Vault, VaultFile};
 use qualia2fa_core::yaotp::{self, YandexPin};
 use qualia2fa_core::{Error, ExposeSecret as _, SecretString};
 
@@ -262,6 +262,20 @@ pub fn core_error_kind(source: &Error) -> &'static str {
         Error::VaultBadKeyCheck => "vault_bad_key_check",
         Error::VaultInvalidUtf8 => "vault_invalid_utf8",
         Error::VaultDecryptionFailed => "vault_decryption_failed",
+        // ── The group tree ─────────────────────────────────────────────────
+        //
+        // Each of these is a different answer for the interface: an unknown group or entry
+        // means the view is stale and has to be refreshed, an immutable top group means the
+        // action does not exist there, and a cycle or a depth refusal means the move the user
+        // asked for cannot be drawn at all.
+        Error::VaultDuplicateGroupId => "vault_duplicate_group_id",
+        Error::VaultGroupNotFound => "vault_group_not_found",
+        Error::VaultGroupUnknownEntry => "vault_group_unknown_entry",
+        Error::VaultTopGroupImmutable => "vault_top_group_immutable",
+        Error::VaultGroupTooManyChildren { .. } => "vault_group_too_many_children",
+        Error::VaultGroupDuplicateChild => "vault_group_duplicate_child",
+        Error::VaultGroupCycle => "vault_group_cycle",
+        Error::VaultGroupDepthExceeded { .. } => "vault_group_depth_exceeded",
         Error::MasterKeyWrongLength { .. } => "master_key_wrong_length",
         Error::FieldTooLong { .. } => "field_too_long",
         Error::VaultIo { .. } => "vault_io",
@@ -327,6 +341,18 @@ pub fn core_error_kind(source: &Error) -> &'static str {
         Error::ExportQrTooLong { .. } => "export_qr_too_long",
         Error::ExportTooLarge => "export_too_large",
         Error::ExportParameterRefused { .. } => "export_parameter_refused",
+        // ── Portable vault containers ──────────────────────────────────────
+        //
+        // A `.q2fa` file that will not open sends the user somewhere different depending on
+        // why: the wrong kind of file, a version this build does not read, a damaged length, a
+        // bare vault file that carries no key, or a passphrase that is missing or wrong.
+        Error::PortableBadMagic => "portable_bad_magic",
+        Error::PortableUnsupportedVersion { .. } => "portable_unsupported_version",
+        Error::PortableTruncated => "portable_truncated",
+        Error::PortableLengthMismatch => "portable_length_mismatch",
+        Error::PortableTooLarge { .. } => "portable_too_large",
+        Error::PortableVaultFileWithoutKey => "portable_vault_file_without_key",
+        Error::PortablePasswordRequired => "portable_password_required",
         // ── Synchronization and the channel ────────────────────────────────
         //
         // The sync family is mapped as a whole rather than only the variants the current
@@ -346,6 +372,7 @@ pub fn core_error_kind(source: &Error) -> &'static str {
         Error::SyncUnknownRecordKind { .. } => "sync_unknown_record_kind",
         Error::SyncMalformed { .. } => "sync_malformed",
         Error::SyncAuthenticationFailed => "sync_authentication_failed",
+        Error::SyncIconRequiresByteTransport => "sync_icon_requires_byte_transport",
         Error::SyncAlreadyApplied => "sync_already_applied",
         Error::SyncIdLogFull { .. } => "sync_id_log_full",
         Error::SyncSenderMismatch => "sync_sender_mismatch",
@@ -2149,6 +2176,84 @@ fn dik_master_key(bytes: Vec<u8>) -> Result<DikMasterKey, FfiError> {
         })
 }
 
+/// The image format of an [`FfiEntryIcon`].
+///
+/// The three are the formats the vault stores. The host side decodes the bytes itself, because
+/// image decoding is a platform API (`BitmapFactory` on one platform, `ImageIO` on another) and
+/// this crate does no decoding of its own. SVG is stored and exported but this version has no
+/// renderer for it: a host that cannot draw one falls back to the letter badge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiIconMime {
+    /// `image/png`.
+    Png,
+    /// `image/jpeg`.
+    Jpeg,
+    /// `image/svg+xml`.
+    Svg,
+}
+
+impl From<FfiIconMime> for qualia2fa_core::vault::IconMime {
+    fn from(value: FfiIconMime) -> Self {
+        match value {
+            FfiIconMime::Png => Self::Png,
+            FfiIconMime::Jpeg => Self::Jpeg,
+            FfiIconMime::Svg => Self::Svg,
+        }
+    }
+}
+
+impl From<qualia2fa_core::vault::IconMime> for FfiIconMime {
+    fn from(value: qualia2fa_core::vault::IconMime) -> Self {
+        match value {
+            qualia2fa_core::vault::IconMime::Png => Self::Png,
+            qualia2fa_core::vault::IconMime::Jpeg => Self::Jpeg,
+            qualia2fa_core::vault::IconMime::Svg => Self::Svg,
+        }
+    }
+}
+
+/// The picture an entry shows beside its name.
+///
+/// The bytes are the original file, not decoded pixels: the platform decodes them when the card
+/// is drawn, and this crate only moves them. The type is **not** a secret, but its bytes are
+/// never printed: `Debug` reports the format and the length.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiEntryIcon {
+    /// The format the bytes are in.
+    pub mime: FfiIconMime,
+    /// The original image file bytes.
+    pub bytes: Vec<u8>,
+}
+
+impl core::fmt::Debug for FfiEntryIcon {
+    /// Prints the format and the length, never the picture.
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("FfiEntryIcon")
+            .field("mime", &self.mime)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+impl FfiEntryIcon {
+    /// Reads an icon as the host side sees it.
+    fn from_core(icon: &qualia2fa_core::vault::EntryIcon) -> Self {
+        Self {
+            mime: icon.mime.into(),
+            bytes: icon.bytes.clone(),
+        }
+    }
+
+    /// Builds a core icon, checking the node limit.
+    fn to_core(&self) -> Result<qualia2fa_core::vault::EntryIcon, FfiError> {
+        Ok(qualia2fa_core::vault::EntryIcon::new(
+            self.mime.into(),
+            self.bytes.clone(),
+        )?)
+    }
+}
+
 /// A 2FA entry, as represented across the FFI boundary.
 ///
 /// Relation to [`uri::OtpAuth`]: that type is the parse result of an `otpauth://`
@@ -2192,31 +2297,81 @@ pub struct FfiVaultEntry {
     pub created_at: u64,
     /// Last modification time in Unix seconds.
     pub updated_at: u64,
+    /// The icon shown beside the name, when the entry has one.
+    ///
+    /// Read and written literally: an update that passes `None` **removes** the icon. The host
+    /// side gets the value back from [`FfiVault::entry`] and hands the same value in when it edits
+    /// other fields, which is what keeps an imported picture alive through an edit.
+    pub icon: Option<FfiEntryIcon>,
 }
 
-/// A group, with the order of the entries in it.
+/// One child of a group: an entry or another group.
 ///
-/// A group is a **sequence**, not a set: the ordering is what the user arranged, and it is
+/// The two live in one type because the child list **is** the display order: an entry and a
+/// child group have to be told apart to be drawn, and the order between them is what the user
+/// arranged. The identifiers are the same 32-character hexadecimal strings the rest of the
+/// surface uses.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiGroupChild {
+    /// An entry that belongs to this group.
+    Entry {
+        /// Entry identifier, 32 hexadecimal characters.
+        id: String,
+    },
+    /// A named group whose children hang from this one.
+    Group {
+        /// Group identifier, 32 hexadecimal characters.
+        id: String,
+    },
+}
+
+impl FfiGroupChild {
+    /// Reads one child as the host side sees it.
+    fn from_core(child: &GroupChild) -> Self {
+        match child {
+            GroupChild::Entry(id) => Self::Entry { id: id.to_string() },
+            GroupChild::Group(id) => Self::Group {
+                id: hex_id(id.as_bytes()),
+            },
+        }
+    }
+
+    /// Turns one child back into the core's type.
+    fn to_core(&self) -> Result<GroupChild, FfiError> {
+        Ok(match self {
+            Self::Entry { id } => GroupChild::Entry(parse_entry_id(id)?),
+            Self::Group { id } => GroupChild::Group(parse_group_id(id)?),
+        })
+    }
+}
+
+/// A group: its name and the ordered list of its children.
+///
+/// A group is a **sequence**, not a set: the child list is what the user arranged, and it is
 /// synchronized between devices (see [`FfiConflict`] for what happens when two devices arrange
 /// the same group differently).
 ///
-/// The **top group** is the one entries belong to when they belong to no named group. It always
-/// exists, it is always first in the group order, it has no name, and its identifier is all
-/// zeroes; [`FfiGroup::top`] says so rather than leaving the host to recognize that identifier.
+/// The **top group** is the root of the tree: entries that belong to no named group live there,
+/// it is always first in pre-order, it has no name, and its identifier is all zeroes;
+/// [`FfiGroup::top`] says so rather than leaving the host to recognize that identifier.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FfiGroup {
     /// The group's identifier, 32 hexadecimal characters.
     pub id: String,
     /// The name, empty for the top group.
     pub name: String,
-    /// Position in the group order, starting at zero.
-    ///
-    /// Assigning a position moves the group there and shifts the others, so the numbers stay a
-    /// dense sequence: they are an order, not a value a host may leave gaps in.
-    pub order: u64,
     /// Whether this is the top group.
     pub top: bool,
-    /// The entries in this group, in order, as 32 hexadecimal characters each.
+    /// The children in display order: entries and child groups mixed.
+    ///
+    /// This is the truth. It is written whole by [`FfiVault::set_children`], the way the vault
+    /// stores it, so a move is one call and has no intermediate state.
+    pub children: Vec<FfiGroupChild>,
+    /// The entries of this group, **derived** from `children`, in the same order.
+    ///
+    /// A view, not a second source of truth: it exists so that a caller that only arranges
+    /// entries does not have to filter `children` itself. Writing the arrangement goes through
+    /// [`FfiVault::set_children`] (whole list) or [`FfiVault::set_ordering`] (entries only).
     pub entry_ids: Vec<String>,
 }
 
@@ -2226,9 +2381,13 @@ impl FfiGroup {
         Self {
             id: hex_id(id.as_bytes()),
             name: group.name.clone(),
-            order: group.group_order as u64,
             top: id.is_top(),
-            entry_ids: group.entry_ids.iter().map(ToString::to_string).collect(),
+            children: group
+                .children
+                .iter()
+                .map(FfiGroupChild::from_core)
+                .collect(),
+            entry_ids: group.entry_ids().iter().map(ToString::to_string).collect(),
         }
     }
 }
@@ -2252,6 +2411,7 @@ impl core::fmt::Debug for FfiVaultEntry {
             .field("note", &self.note)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
+            .field("icon", &self.icon)
             .finish_non_exhaustive()
     }
 }
@@ -2276,6 +2436,7 @@ impl FfiVaultEntry {
             note: entry.note.clone(),
             created_at: entry.created_at,
             updated_at: entry.updated_at,
+            icon: entry.icon.as_ref().map(FfiEntryIcon::from_core),
         }
     }
 
@@ -2292,6 +2453,10 @@ impl FfiVaultEntry {
             check_len("issuer", issuer, MAX_VAULT_FIELD_CHARS)?;
         }
         let secret = OtpSecret::from_base32(&self.secret_base32)?;
+        let icon = match &self.icon {
+            Some(icon) => Some(icon.to_core()?),
+            None => None,
+        };
         Ok(Entry::new(
             self.name.clone(),
             self.issuer.clone(),
@@ -2303,7 +2468,8 @@ impl FfiVaultEntry {
             self.note.clone(),
             now,
             now,
-        )?)
+        )?
+        .with_icon(icon))
     }
 
     /// Parses the 16-byte hexadecimal identifier.
@@ -2636,29 +2802,56 @@ impl FfiVault {
         Ok(self.lock().vault_mut().remove(&id, now).is_some())
     }
 
-    /// The groups, in the group order, with the ordering of each.
+    /// The groups in **pre-order**: the top group first, then each group's children depth-first.
     ///
-    /// The top group is always there and always **first**, so a host that shows "all entries" has
-    /// one place to look: its `entry_ids` are the entries that belong to no named group. The named
-    /// groups follow in `order`, which is the order [`FfiVault::move_group`] positions refer to.
-    ///
-    /// # Why the sort is not by `order` alone
-    ///
-    /// The top group's order is zero, and the first named group's order is zero as well: the core
-    /// numbers named groups from zero and keeps the top group out of that sequence. Sorting every
-    /// group by its order alone would therefore leave the top group's place to a tie-break, so the
-    /// sort here states the rule instead - the top group first, then named groups by order and
-    /// identifier, which is what the core's own ordering means.
+    /// That is the tree the core stores and the order the interface draws; the host does not
+    /// sort, because a sort would be a second opinion about the arrangement. `children` is the
+    /// truth (entries and child groups mixed), and `entry_ids` is the derived view of its entry
+    /// children.
     #[must_use]
     pub fn groups(&self) -> Vec<FfiGroup> {
         let vault = self.lock();
-        let mut groups: Vec<FfiGroup> = vault
+        vault
             .vault()
             .groups()
             .map(|(id, group)| FfiGroup::from_core(id, group))
-            .collect();
-        groups.sort_by_key(|group| (!group.top, group.order, group.id.clone()));
-        groups
+            .collect()
+    }
+
+    /// The ordered children of one group, or `None` when there is no such group.
+    #[must_use]
+    pub fn children_of(&self, group_id: String) -> Option<Vec<FfiGroupChild>> {
+        let id = parse_group_id(&group_id).ok()?;
+        let vault = self.lock();
+        vault
+            .vault()
+            .children_of(&id)
+            .map(|children| children.iter().map(FfiGroupChild::from_core).collect())
+    }
+
+    /// The parent of a named group, or `None` for the top group and an unknown identifier.
+    ///
+    /// Worked out from the child lists, which is where the parent relationship lives; there is no
+    /// parent field to read.
+    #[must_use]
+    pub fn parent_of(&self, group_id: String) -> Option<String> {
+        let id = parse_group_id(&group_id).ok()?;
+        let vault = self.lock();
+        vault
+            .vault()
+            .parent_of(&id)
+            .map(|parent| hex_id(parent.as_bytes()))
+    }
+
+    /// The depth of a group: the top group is 0, its named children 1, and so on.
+    #[must_use]
+    pub fn depth_of(&self, group_id: String) -> Option<u64> {
+        let id = parse_group_id(&group_id).ok()?;
+        let vault = self.lock();
+        vault
+            .vault()
+            .depth_of(&id)
+            .map(|depth| u64::try_from(depth).unwrap_or(u64::MAX))
     }
 
     /// The group an entry belongs to, as 32 hexadecimal characters.
@@ -2675,7 +2868,7 @@ impl FfiVault {
             .map(|group| hex_id(group.as_bytes()))
     }
 
-    /// Creates a named group at the end of the group order and returns its identifier.
+    /// Creates a named group under the **top group** and returns its identifier.
     ///
     /// # Errors
     ///
@@ -2688,6 +2881,25 @@ impl FfiVault {
             });
         }
         let id = self.lock().vault_mut().create_group(name)?;
+        Ok(hex_id(id.as_bytes()))
+    }
+
+    /// Creates a named group as the **last child** of `parent_id` and returns its identifier.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::VaultGroupNotFound`] (`kind` is `vault_group_not_found`) for an unknown parent,
+    /// [`Error::VaultGroupDepthExceeded`] (`vault_group_depth_exceeded`) when the new group would
+    /// be nested deeper than the interface can draw, and `field_too_long` for an over-long name.
+    pub fn create_group_in(&self, parent_id: String, name: String) -> Result<String, FfiError> {
+        check_len("group_name", &name, MAX_VAULT_FIELD_CHARS)?;
+        if name.is_empty() {
+            return Err(FfiError::InputEmpty {
+                kind: "group_name".to_owned(),
+            });
+        }
+        let parent = parse_group_id(&parent_id)?;
+        let id = self.lock().vault_mut().create_group_in(&parent, name)?;
         Ok(hex_id(id.as_bytes()))
     }
 
@@ -2704,33 +2916,37 @@ impl FfiVault {
         Ok(())
     }
 
-    /// Moves a group to a position among the **named** groups.
+    /// Replaces the whole child list of a group: the one write behind every move.
     ///
-    /// The position is where the group ends up, not how far it moves: the caller says "make this
-    /// the second group" rather than "move it up by one", so a caller that has just reloaded the
-    /// list cannot shift a group by the wrong amount. The top group is not part of that sequence -
-    /// it stays first - so position `0` means the first named group, and a position past the end
-    /// puts the group last.
+    /// A list is a sequence, and this is how the vault stores one, so a move, an insertion or a
+    /// deletion is a single call with no intermediate state. A child the new list drops is not
+    /// deleted: an entry returns to the top group and a child group moves to this group's parent.
     ///
     /// # Errors
     ///
-    /// [`Error::VaultGroupNotFound`] for an unknown identifier, and
-    /// [`Error::VaultTopGroupImmutable`] for the top group, whose place is fixed.
-    pub fn move_group(&self, group_id: String, position: u64) -> Result<(), FfiError> {
+    /// - `vault_group_not_found`: the group or a child group does not exist.
+    /// - `vault_group_unknown_entry`: a child names an entry the vault does not hold.
+    /// - `vault_group_duplicate_child`: the list names one child twice.
+    /// - `vault_group_cycle`: the list would put a group inside itself.
+    /// - `vault_group_depth_exceeded`: the moved subtree would be nested too deeply.
+    pub fn set_children(
+        &self,
+        group_id: String,
+        children: Vec<FfiGroupChild>,
+    ) -> Result<(), FfiError> {
         let id = parse_group_id(&group_id)?;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "a group order is a small number of groups, and the core rejects a position past the end"
-        )]
-        let position = position as usize;
-        self.lock().vault_mut().reorder_group(&id, position)?;
+        let mut parsed = Vec::with_capacity(children.len());
+        for child in &children {
+            parsed.push(child.to_core()?);
+        }
+        self.lock().vault_mut().set_children(&id, parsed)?;
         Ok(())
     }
 
     /// Removes a group.
     ///
-    /// The entries in it are **not** deleted: they return to the top group, which is what "belongs
-    /// to no named group" means.
+    /// Nothing is deleted: the group's children move to its parent, keeping their relative order
+    /// and their place in that parent's list.
     ///
     /// # Errors
     ///
@@ -2742,17 +2958,17 @@ impl FfiVault {
         Ok(())
     }
 
-    /// Replaces the ordering of a group.
+    /// Replaces the **entry** children of a group, keeping the positions of its child groups.
     ///
-    /// The list is the whole ordering, not a change to it: a host that reorders one row sends the
-    /// result, which is both simpler and safer than describing a move. Entries the new ordering
-    /// drops return to the top group unless another group claims them.
+    /// The list is the whole entry sequence, not a change to it: a host that reorders one row
+    /// sends the result, which is both simpler and safer than describing a move. Entries the new
+    /// list drops return to the top group unless another group claims them.
     ///
     /// # Errors
     ///
     /// [`Error::VaultGroupNotFound`] for an unknown group,
     /// [`Error::VaultGroupUnknownEntry`] for an identifier the vault does not hold, and
-    /// [`Error::VaultGroupDuplicateEntry`] when the list names one entry twice.
+    /// [`Error::VaultGroupDuplicateChild`] when the list names one entry twice.
     pub fn set_ordering(&self, group_id: String, entry_ids: Vec<String>) -> Result<(), FfiError> {
         let id = parse_group_id(&group_id)?;
         let mut parsed = Vec::with_capacity(entry_ids.len());
@@ -4233,14 +4449,25 @@ pub fn detect_import_format(bytes: Vec<u8>) -> Option<FfiImportFormat> {
 
 /// An export format the host side can choose.
 ///
-/// The four are the shapes another authenticator reads. They are **not equally safe**: only
-/// [`FfiExportFormat::EncryptedJson`] protects anything, and the other three hold every secret
-/// in the vault as it stands, because that is what makes them readable by something else.
+/// The six are the interface's numbered choices, in the order the interface offers them: the two
+/// `.q2fa` containers first, then the four shapes another authenticator reads.
+///
+/// # They are not equally safe, and not equally complete
+///
+/// Only the two encrypted forms protect anything. The plain vault container is the format that
+/// restores an account on a clean device, and it does so because the **master key is inside it in
+/// clear** - the interface has to say that more strongly than it says anything about the other
+/// files. [`FfiExportFormat::EncryptedVault`] and [`FfiExportFormat::EncryptedJson`] ask for a
+/// password; the other four hold every secret as it stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum FfiExportFormat {
+    /// A plain `.q2fa`: the master key in clear plus the whole vault ciphertext.
+    Vault,
+    /// A passphrase-protected `.q2fa`: the master key wrapped by the core recovery format.
+    EncryptedVault,
     /// One `otpauth://` URI per line. Carries no name, no note and no group.
     Text,
-    /// The JSON export: every field, the groups and their order included.
+    /// The JSON export: every field, the flat groups and the icons included.
     Json,
     /// The JSON export, locked with a password.
     EncryptedJson,
@@ -4254,10 +4481,36 @@ pub enum FfiExportFormat {
 impl From<FfiExportFormat> for qualia2fa_core::export::ExportFormat {
     fn from(value: FfiExportFormat) -> Self {
         match value {
+            FfiExportFormat::Vault => Self::Vault,
+            FfiExportFormat::EncryptedVault => Self::EncryptedVault,
             FfiExportFormat::Text => Self::Text,
             FfiExportFormat::Json => Self::Json,
             FfiExportFormat::EncryptedJson => Self::EncryptedJson,
             FfiExportFormat::Html => Self::Html,
+        }
+    }
+}
+
+/// How much of the group tree an export format carries.
+///
+/// A boolean would be a lie for the JSON forms: they keep the group **names and memberships** and
+/// lose the nesting, and the interface must be able to say which it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiGroupCarrying {
+    /// The format has nowhere to put a group.
+    None,
+    /// The format keeps the named groups as one flat level, without the nesting.
+    FlatGroups,
+    /// The format keeps the whole tree: parents, nesting and the mixed order.
+    FullTree,
+}
+
+impl From<qualia2fa_core::export::GroupCarrying> for FfiGroupCarrying {
+    fn from(value: qualia2fa_core::export::GroupCarrying) -> Self {
+        match value {
+            qualia2fa_core::export::GroupCarrying::None => Self::None,
+            qualia2fa_core::export::GroupCarrying::FlatGroups => Self::FlatGroups,
+            qualia2fa_core::export::GroupCarrying::FullTree => Self::FullTree,
         }
     }
 }
@@ -4274,7 +4527,8 @@ pub fn export_format_needs_password(format: FfiExportFormat) -> bool {
 
 /// The file name extension for this format, without the dot.
 ///
-/// Both JSON forms share one: they are the same file with and without a password.
+/// Both JSON forms share one, and so do both `.q2fa` forms: they are the same file with and
+/// without a password, and a reader tells them apart by the magic or by the `db` field.
 #[uniffi::export]
 #[must_use]
 pub fn export_format_extension(format: FfiExportFormat) -> String {
@@ -4283,14 +4537,132 @@ pub fn export_format_extension(format: FfiExportFormat) -> String {
         .to_owned()
 }
 
-/// Whether this format carries the groups and the order inside them.
+/// Whether this format carries the groups **at all**.
 ///
-/// Only the JSON forms do. A caller uses it to say so in the interface rather than letting the
-/// user discover it after importing the file somewhere else.
+/// Kept for callers that only need "does it keep my groups"; the interface should prefer
+/// [`export_format_group_carrying`], which tells the flat JSON forms apart from the two `.q2fa`
+/// containers.
 #[uniffi::export]
 #[must_use]
 pub fn export_format_carries_groups(format: FfiExportFormat) -> bool {
     qualia2fa_core::export::ExportFormat::from(format).carries_groups()
+}
+
+/// How much of the group tree this format carries.
+#[uniffi::export]
+#[must_use]
+pub fn export_format_group_carrying(format: FfiExportFormat) -> FfiGroupCarrying {
+    qualia2fa_core::export::ExportFormat::from(format)
+        .group_carrying()
+        .into()
+}
+
+/// The deepest a named group may be nested; the top group is depth zero.
+///
+/// The interface uses it to refuse a drop it cannot draw, and the vault enforces the same value.
+#[uniffi::export]
+#[must_use]
+pub fn max_group_depth() -> u64 {
+    u64::try_from(qualia2fa_core::vault::Vault::MAX_GROUP_DEPTH).unwrap_or(u64::MAX)
+}
+
+// ── Portable vault files ─────────────────────────────────────────────
+
+/// What a `.q2fa` file turned out to be, judged by its magic.
+///
+/// # It says nothing about the contents
+///
+/// A file can carry the right magic and still be damaged, and the encrypted form still needs its
+/// passphrase. What this answers is what the **interface** needs before it asks anything: whether
+/// to show a password field, whether the file is a full backup, or whether it is the old key-only
+/// shape that can only reopen a vault this device already has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiPortableKind {
+    /// The master key in clear plus the vault ciphertext.
+    PlainVault,
+    /// The passphrase-wrapped master key plus the vault ciphertext.
+    EncryptedVault,
+    /// The old key-only recovery file: no entries of its own.
+    KeyOnly,
+}
+
+impl From<qualia2fa_core::portable::PortableKind> for FfiPortableKind {
+    fn from(value: qualia2fa_core::portable::PortableKind) -> Self {
+        match value {
+            qualia2fa_core::portable::PortableKind::PlainVault => Self::PlainVault,
+            qualia2fa_core::portable::PortableKind::EncryptedVault => Self::EncryptedVault,
+            qualia2fa_core::portable::PortableKind::KeyOnly => Self::KeyOnly,
+        }
+    }
+}
+
+/// Recognizes a portable vault file without opening it.
+///
+/// `None` means the file is not one of the three portable shapes. In particular a **bare vault
+/// file** (`Q2FAVLT\0`) answers `None`: it holds ciphertext but no master key, and the interface
+/// should tell the user to export a vault backup instead of trying to import it.
+#[uniffi::export]
+#[must_use]
+pub fn detect_portable_file(file: Vec<u8>) -> Option<FfiPortableKind> {
+    qualia2fa_core::portable::detect(&file).map(FfiPortableKind::from)
+}
+
+/// What opening a portable vault file produced.
+///
+/// The two cases are kept apart rather than folded into "a vault or an error": an old key-only
+/// file is a legitimate file, and the reason it cannot restore an account on its own is a
+/// property of the file, not a failure.
+#[derive(uniffi::Record)]
+pub struct FfiPortableRestore {
+    /// The restored vault, when the file carried one. Its master key is already stored.
+    pub vault: Option<Arc<FfiVault>>,
+    /// Whether the file was an old key-only recovery file.
+    ///
+    /// Nothing was written in that case. A caller that has a local vault may retry with
+    /// [`import_recovery_key`] and open that vault with the restored key.
+    pub key_only: bool,
+}
+
+/// Restores an account from a portable `.q2fa` file.
+///
+/// # What it does
+///
+/// Splits the container, recovers the master key (from the file itself for the plain form, from
+/// the passphrase for the encrypted one), **writes the key into the platform store**, and opens
+/// the vault the container carries. If the vault does not open, the previous key is put back
+/// before the error is returned: a damaged or mismatched file must not leave the device on a key
+/// that opens nothing.
+///
+/// # Errors
+///
+/// - `portable_vault_file_without_key`: the file is a bare vault file.
+/// - `portable_password_required`: the encrypted form was opened with no password.
+/// - `portable_bad_magic`, `portable_unsupported_version`, `portable_truncated`,
+///   `portable_length_mismatch`, `portable_too_large`: the container is malformed.
+/// - `recovery_authentication_failed`: the passphrase is wrong, or the wrapped part was modified.
+/// - `vault_decryption_failed`: the key does not open the vault the file carries; the previous
+///   key has been put back.
+#[uniffi::export]
+pub fn open_portable_file(
+    file: Vec<u8>,
+    password: Option<String>,
+    store: Arc<dyn FfiSecureStore>,
+) -> Result<FfiPortableRestore, FfiError> {
+    if let Some(password) = &password {
+        check_len("passphrase", password, MAX_PASSPHRASE_CHARS)?;
+    }
+    let passphrase = SecretString::from(password.unwrap_or_default());
+    let mut store = ForeignSecureStore(store);
+    match flow::open_portable(&file, &passphrase, &mut store)? {
+        flow::PortableRestore::Vault(vault_file) => Ok(FfiPortableRestore {
+            vault: Some(FfiVault::wrap(vault_file)),
+            key_only: false,
+        }),
+        flow::PortableRestore::KeyOnly => Ok(FfiPortableRestore {
+            vault: None,
+            key_only: true,
+        }),
+    }
 }
 
 #[uniffi::export]
@@ -4302,11 +4674,13 @@ impl FfiVault {
     ///
     /// # What crosses the boundary
     ///
-    /// For the three plaintext formats, **every secret in the vault, in the clear**. That is
-    /// what an export is - the other application has to be able to read it - and it is why the
-    /// interface has to say so before the file is written. [`FfiExportFormat::EncryptedJson`]
-    /// with a password is the one form that protects anything; an empty password is refused
-    /// rather than accepted.
+    /// For [`FfiExportFormat::Vault`], **the master key in clear** beside the vault ciphertext:
+    /// that is what lets the file restore an account on a clean device, and it is why the
+    /// interface must warn more strongly about it than about the four formats another
+    /// authenticator reads. [`FfiExportFormat::EncryptedVault`] is the same pair with the master
+    /// key wrapped by a passphrase. The three plaintext external formats hold every secret in
+    /// the vault as it stands; only the two encrypted forms protect anything, and an empty
+    /// password is refused rather than accepted.
     ///
     /// # The lock is held for the whole call
     ///
@@ -4318,12 +4692,12 @@ impl FfiVault {
     ///
     /// # Errors
     ///
-    /// The core's kind reaches the host side: `export_password_required` when the encrypted form
-    /// was chosen with no password, `export_password_empty`, `uri_account_contains_colon` when an
-    /// entry's account cannot be written into a URI, `export_qr_too_long` when one entry's URI
-    /// does not fit the QR code of the HTML export, and `randomness_unavailable` when the OS
-    /// random source is unavailable (the salt, the master key and both nonces of the encrypted
-    /// form come from it).
+    /// The core's kind reaches the host side: `export_password_required` when either encrypted
+    /// form was chosen with no password, `export_password_empty`, `uri_account_contains_colon`
+    /// when an entry's account cannot be written into a URI, `export_qr_too_long` when one
+    /// entry's URI does not fit the QR code of the HTML export, `export_too_large` when the
+    /// vault does not fit a `.q2fa` container, and `randomness_unavailable` when the OS random
+    /// source is unavailable (the salt, the nonces and the master key come from it).
     pub fn export(
         &self,
         format: FfiExportFormat,
@@ -4331,8 +4705,7 @@ impl FfiVault {
     ) -> Result<Vec<u8>, FfiError> {
         let password = password.map(String::into_bytes);
         let vault = self.lock();
-        let bytes =
-            qualia2fa_core::export::export(vault.vault(), format.into(), password.as_deref())?;
+        let bytes = qualia2fa_core::export::export(&vault, format.into(), password.as_deref())?;
         Ok(bytes)
     }
 }
@@ -4393,27 +4766,35 @@ impl FfiConflictSide {
 /// Two arrangements of the same group, for the user to choose between.
 ///
 /// A group is a **sequence**, so two devices can disagree about it without disagreeing about a
-/// single entry: each added its own entries, or one reordered what both have. Neither side is
+/// single entry: each added its own children, or one reordered what both have. Neither side is
 /// wrong, which is why this is the user's choice and not a merge rule.
 ///
-/// The two lists hold entry identifiers (32 hexadecimal characters) in order. An identifier the
-/// vault does not hold is one the peer knows and this device does not; the host side can look up
-/// the names of the rest in its own entry list. The identifiers are the same on both sides for
-/// every entry both devices hold, so what is being chosen is an **order**, not a set.
+/// The two lists hold the whole child arrangement - entries and child groups mixed - in display
+/// order. A reference the vault does not hold is one the peer knows and this device does not; the
+/// host side can look up the names of the rest in its own group list. The identifiers are the
+/// same on both sides for every child both devices hold, so what is being chosen is an
+/// **arrangement**, not a set.
+///
+/// # Moving a group can produce two of these
+///
+/// Moving a group between parents rewrites the old parent's list and the new parent's list, and
+/// each is a separate record, so each can be reported. They are independent conflicts about two
+/// different groups; applying either answer keeps the tree valid, because a child has only one
+/// parent.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FfiOrderingConflict {
     /// The group's name on this device.
     pub local_name: String,
     /// The group's name on the peer, which differs when the disagreement is a rename.
     pub incoming_name: String,
-    /// Whether this is the group entries belong to when they belong to no named one.
+    /// Whether this is the top group, which entries belong to when they belong to no named one.
     ///
     /// Such a group has no name, and the two name fields are empty.
     pub top: bool,
     /// This device's arrangement, in order.
-    pub local: Vec<String>,
+    pub local: Vec<FfiGroupChild>,
     /// The peer's arrangement, in order.
-    pub incoming: Vec<String>,
+    pub incoming: Vec<FfiGroupChild>,
 }
 
 /// One disagreement a human has to settle.
@@ -4465,9 +4846,17 @@ impl FfiConflict {
                 ordering = Some(FfiOrderingConflict {
                     local_name: local.name.clone(),
                     incoming_name: incoming.name.clone(),
-                    top: local.group_order == 0 && local.name.is_empty(),
-                    local: local.entry_ids.iter().map(ToString::to_string).collect(),
-                    incoming: incoming.entry_ids.iter().map(ToString::to_string).collect(),
+                    top: conflict.group_id().is_some_and(|id| id.is_top()),
+                    local: local
+                        .children
+                        .iter()
+                        .map(FfiGroupChild::from_core)
+                        .collect(),
+                    incoming: incoming
+                        .children
+                        .iter()
+                        .map(FfiGroupChild::from_core)
+                        .collect(),
                 });
                 (None, None, false)
             }
@@ -5442,6 +5831,7 @@ mod tests {
             note: String::new(),
             created_at: 0,
             updated_at: 0,
+            icon: None,
         }
     }
 
@@ -5775,6 +6165,20 @@ mod tests {
             core_error_kind(&Error::VaultDecryptionFailed),
             core_error_kind(&Error::VaultEntryNotFound),
             core_error_kind(&Error::VaultBadKeyCheck),
+            core_error_kind(&Error::VaultDuplicateGroupId),
+            core_error_kind(&Error::VaultGroupNotFound),
+            core_error_kind(&Error::VaultGroupUnknownEntry),
+            core_error_kind(&Error::VaultTopGroupImmutable),
+            core_error_kind(&Error::VaultGroupTooManyChildren {
+                limit: 1,
+                actual: 2,
+            }),
+            core_error_kind(&Error::VaultGroupDuplicateChild),
+            core_error_kind(&Error::VaultGroupCycle),
+            core_error_kind(&Error::VaultGroupDepthExceeded {
+                limit: 3,
+                actual: 4,
+            }),
             core_error_kind(&Error::MasterKeyWrongLength {
                 expected: 32,
                 actual: 1,
@@ -5790,6 +6194,7 @@ mod tests {
             core_error_kind(&Error::SyncNoSessionFound),
             core_error_kind(&Error::SyncSenderMismatch),
             core_error_kind(&Error::SyncAuthenticationFailed),
+            core_error_kind(&Error::SyncIconRequiresByteTransport),
             core_error_kind(&Error::SyncIdLogFull { limit: 4096 }),
             core_error_kind(&Error::TransportFailed { reason: "test" }),
             core_error_kind(&Error::TransportAlreadyUsed),
@@ -5826,6 +6231,19 @@ mod tests {
             core_error_kind(&Error::ExportQrTooLong { position: 1 }),
             core_error_kind(&Error::ExportTooLarge),
             core_error_kind(&Error::ExportParameterRefused { parameter: "test" }),
+            // Portable vault containers. Each way one can fail sends the host side somewhere
+            // different: choose another file, update the application, re-export, or supply the
+            // passphrase.
+            core_error_kind(&Error::PortableBadMagic),
+            core_error_kind(&Error::PortableUnsupportedVersion { version: 2 }),
+            core_error_kind(&Error::PortableTruncated),
+            core_error_kind(&Error::PortableLengthMismatch),
+            core_error_kind(&Error::PortableTooLarge {
+                limit: 1,
+                actual: 2,
+            }),
+            core_error_kind(&Error::PortableVaultFileWithoutKey),
+            core_error_kind(&Error::PortablePasswordRequired),
             // The master key storage failures of the device identity library. Each one sends
             // the host side somewhere different, so each one needs a kind of its own: a blob
             // that will not unwrap wants a recovery path, a platform with no backend wants
@@ -6115,8 +6533,8 @@ mod tests {
     /// The interface's questions about a format, answered without naming a file.
     #[test]
     fn the_export_formats_describe_themselves() {
-        assert!(export_format_needs_password(FfiExportFormat::EncryptedJson));
         for format in [
+            FfiExportFormat::Vault,
             FfiExportFormat::Text,
             FfiExportFormat::Json,
             FfiExportFormat::Html,
@@ -6126,7 +6544,22 @@ mod tests {
                 "{format:?} is written as it stands"
             );
         }
+        for format in [
+            FfiExportFormat::EncryptedVault,
+            FfiExportFormat::EncryptedJson,
+        ] {
+            assert!(
+                export_format_needs_password(format),
+                "{format:?} asks for a password"
+            );
+        }
 
+        assert_eq!(export_format_extension(FfiExportFormat::Vault), "q2fa");
+        assert_eq!(
+            export_format_extension(FfiExportFormat::EncryptedVault),
+            "q2fa",
+            "both vault containers are one file with and without a password"
+        );
         assert_eq!(export_format_extension(FfiExportFormat::Text), "txt");
         assert_eq!(export_format_extension(FfiExportFormat::Json), "json");
         assert_eq!(
@@ -6136,13 +6569,151 @@ mod tests {
         );
         assert_eq!(export_format_extension(FfiExportFormat::Html), "html");
 
-        assert!(export_format_carries_groups(FfiExportFormat::Json));
-        assert!(export_format_carries_groups(FfiExportFormat::EncryptedJson));
-        assert!(
-            !export_format_carries_groups(FfiExportFormat::Text),
+        assert_eq!(
+            export_format_group_carrying(FfiExportFormat::Vault),
+            FfiGroupCarrying::FullTree
+        );
+        assert_eq!(
+            export_format_group_carrying(FfiExportFormat::EncryptedVault),
+            FfiGroupCarrying::FullTree
+        );
+        assert_eq!(
+            export_format_group_carrying(FfiExportFormat::Json),
+            FfiGroupCarrying::FlatGroups,
+            "the JSON forms keep the group names and memberships, not the nesting"
+        );
+        assert_eq!(
+            export_format_group_carrying(FfiExportFormat::EncryptedJson),
+            FfiGroupCarrying::FlatGroups
+        );
+        assert_eq!(
+            export_format_group_carrying(FfiExportFormat::Text),
+            FfiGroupCarrying::None,
             "a list of URIs has nowhere to put a group"
         );
-        assert!(!export_format_carries_groups(FfiExportFormat::Html));
+        assert_eq!(
+            export_format_group_carrying(FfiExportFormat::Html),
+            FfiGroupCarrying::None
+        );
+        assert!(!export_format_carries_groups(FfiExportFormat::Text));
+        assert!(export_format_carries_groups(FfiExportFormat::Json));
+        assert!(export_format_carries_groups(FfiExportFormat::Vault));
+        assert_eq!(max_group_depth(), 3);
+    }
+
+    /// A plain `.q2fa` restores on a clean device, and the key is written to its store.
+    #[test]
+    fn a_plain_portable_vault_restores_through_the_boundary() {
+        let (vault, _) = registered_vault("device-a");
+        vault
+            .add_entry(sample_entry("GitHub"), NOW)
+            .expect("the entry should be added");
+        let bytes = vault
+            .export(FfiExportFormat::Vault, None)
+            .expect("the plain container is written");
+        assert_eq!(
+            detect_portable_file(bytes.clone()),
+            Some(FfiPortableKind::PlainVault)
+        );
+
+        let store = Arc::new(TestStore::default());
+        let restored = open_portable_file(bytes, None, store.clone()).expect("it opens");
+        assert!(!restored.key_only);
+        let restored = restored.vault.expect("the file carried a vault");
+        assert_eq!(restored.entry_count(), 1, "the entry came along");
+        assert!(
+            store
+                .master
+                .lock()
+                .expect("no lock poisoning in tests")
+                .is_some(),
+            "the restored key must be in the platform store"
+        );
+    }
+
+    /// The encrypted container needs its passphrase, and a wrong one changes nothing.
+    #[test]
+    fn an_encrypted_portable_vault_needs_its_passphrase() {
+        let (vault, _) = registered_vault("device-a");
+        vault
+            .add_entry(sample_entry("GitHub"), NOW)
+            .expect("the entry should be added");
+        let bytes = vault
+            .export(
+                FfiExportFormat::EncryptedVault,
+                Some("correct horse".to_owned()),
+            )
+            .expect("the encrypted container is written");
+        assert_eq!(
+            detect_portable_file(bytes.clone()),
+            Some(FfiPortableKind::EncryptedVault)
+        );
+
+        let store = Arc::new(TestStore::default());
+        let missing = open_portable_file(bytes.clone(), None, store.clone());
+        assert!(
+            missing.is_err(),
+            "a passphrase-protected file must not open without one"
+        );
+        assert!(
+            store
+                .master
+                .lock()
+                .expect("no lock poisoning in tests")
+                .is_none(),
+            "a failed open must not write a key"
+        );
+
+        let wrong = open_portable_file(bytes.clone(), Some("wrong".to_owned()), store.clone());
+        assert!(wrong.is_err());
+
+        let opened = open_portable_file(bytes, Some("correct horse".to_owned()), store)
+            .expect("the right passphrase opens it");
+        assert_eq!(
+            opened
+                .vault
+                .expect("the file carried a vault")
+                .entry_count(),
+            1
+        );
+    }
+
+    /// The two shapes that are not a full backup are recognized and answered.
+    #[test]
+    fn a_bare_vault_file_and_a_key_only_file_are_told_apart() {
+        let (vault, _) = registered_vault("device-a");
+        let bare = vault.serialize().expect("should serialize");
+        assert_eq!(
+            detect_portable_file(bare.clone()),
+            None,
+            "a bare vault file is not a portable container"
+        );
+        let refused = match open_portable_file(bare, None, Arc::new(TestStore::default())) {
+            Ok(_) => panic!("a bare vault file carries no key"),
+            Err(error) => error,
+        };
+        assert_eq!(refused.kind(), "portable_vault_file_without_key");
+
+        let key_only = vault
+            .export_recovery_key("passphrase".to_owned(), None, None, None)
+            .expect("the old key-only file is written");
+        assert_eq!(
+            detect_portable_file(key_only.clone()),
+            Some(FfiPortableKind::KeyOnly)
+        );
+        let store = Arc::new(TestStore::default());
+        let outcome = open_portable_file(key_only, Some("passphrase".to_owned()), store.clone())
+            .expect("the file is valid");
+        assert!(outcome.key_only, "the old shape carries no entries");
+        assert!(outcome.vault.is_none());
+        assert!(
+            store
+                .master
+                .lock()
+                .expect("no lock poisoning in tests")
+                .is_none(),
+            "nothing was written, so a local vault cannot be left on a new key"
+        );
     }
 
     /// Every kind the vault holds comes back out of every format, across the boundary.
@@ -6308,13 +6879,10 @@ mod tests {
         );
     }
 
-    /// Groups and orderings cross the boundary as sequences.
+    /// Groups and their child lists cross the boundary, and the tree is what the host reads.
     #[test]
     fn groups_and_orderings_cross_the_boundary() {
-        let keys = Arc::new(TestKeys::default());
-        let store = Arc::new(TestStore::default());
-        let vault = FfiVault::register(keys, store, "device-a".to_owned())
-            .expect("registration should succeed");
+        let (vault, _) = registered_vault("device-a");
         let top = "0".repeat(32);
 
         let first = vault
@@ -6330,10 +6898,17 @@ mod tests {
         assert!(groups[0].top);
         assert_eq!(groups[0].id, top);
         assert!(groups[0].name.is_empty());
+        assert_eq!(
+            groups[0].children,
+            vec![
+                FfiGroupChild::Entry { id: first.clone() },
+                FfiGroupChild::Entry { id: second.clone() }
+            ]
+        );
         assert_eq!(groups[0].entry_ids, vec![first.clone(), second.clone()]);
         assert_eq!(vault.group_of(first.clone()), Some(top.clone()));
 
-        // A new group goes to the end of the order and receives an entry.
+        // A new group is appended to the top group's children and receives an entry.
         let work = vault
             .create_group("Work".to_owned())
             .expect("creates the group");
@@ -6352,46 +6927,122 @@ mod tests {
         );
         assert_eq!(vault.group_of(first.clone()), Some(work.clone()));
 
-        // Renaming and moving are visible in the next read.
-        let later = vault.create_group("Later".to_owned()).expect("creates");
+        // A child group lives inside its parent, and the pre-order walk shows it there.
+        let sub = vault
+            .create_group_in(work.clone(), "Sub".to_owned())
+            .expect("creates the child group");
+        assert_eq!(vault.parent_of(sub.clone()), Some(work.clone()));
+        assert_eq!(vault.depth_of(sub.clone()), Some(2));
+        assert_eq!(vault.parent_of(work.clone()), Some(top.clone()));
+        assert_eq!(
+            vault.children_of(work.clone()),
+            Some(vec![
+                FfiGroupChild::Entry { id: first.clone() },
+                FfiGroupChild::Group { id: sub.clone() }
+            ])
+        );
+        let names: Vec<String> = vault.groups().into_iter().map(|group| group.name).collect();
+        assert_eq!(
+            names,
+            vec![String::new(), "Work".to_owned(), "Sub".to_owned()]
+        );
+
+        // A whole list is one write: the entries move to the top group, and the child group
+        // stays where it was.
+        vault
+            .set_children(
+                top.clone(),
+                vec![
+                    FfiGroupChild::Entry { id: second.clone() },
+                    FfiGroupChild::Group { id: work.clone() },
+                ],
+            )
+            .expect("the list is valid");
+        assert_eq!(vault.parent_of(sub.clone()), Some(work.clone()));
+
+        // Renaming is visible in the next read; the top group has no name to change.
         vault
             .rename_group(work.clone(), "Work stuff".to_owned())
             .expect("renames");
-        vault
-            .move_group(later.clone(), 0)
-            .expect("moves to the front of the named groups");
-        let groups = vault.groups();
-        assert_eq!(groups[1].id, later, "the move put it first among the named");
-        assert_eq!(groups[2].name, "Work stuff");
-        assert!(groups[0].top);
+        assert_eq!(vault.groups()[1].name, "Work stuff");
+        assert!(
+            vault.rename_group(top.clone(), "Nope".to_owned()).is_err(),
+            "the top group has no name"
+        );
 
-        // The top group cannot be renamed or moved.
-        assert!(vault.rename_group(top.clone(), "Nope".to_owned()).is_err());
-        assert!(vault.move_group(top.clone(), 1).is_err());
+        // A group cannot be put inside its own subtree.
+        let cycle =
+            vault.set_children(sub.clone(), vec![FfiGroupChild::Group { id: work.clone() }]);
+        assert!(
+            cycle.is_err(),
+            "a group inside its own ancestor must be refused"
+        );
 
-        // The ordering is the whole list: an entry the new list drops returns to the top group.
+        // Setting an ordering moves the entries it names and leaves the child groups' places.
         vault
-            .set_ordering(later.clone(), vec![first.clone()])
+            .set_ordering(work.clone(), vec![first.clone(), second.clone()])
             .expect("sets the ordering");
         assert_eq!(
             vault.groups()[1].entry_ids,
-            vec![first.clone()],
-            "the entry is where the ordering put it"
-        );
-        assert!(
-            vault.groups()[0].entry_ids.contains(&second),
-            "and nothing was lost"
+            vec![first.clone(), second.clone()],
+            "the entries are where the ordering put them"
         );
 
-        // Removing a group returns its entries to the top group; no entry is deleted with it.
-        vault.remove_group(later).expect("removes the group");
+        // Removing a group moves its children to its parent; no entry is deleted with it.
+        vault.remove_group(work.clone()).expect("removes the group");
         let groups = vault.groups();
-        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.len(), 2, "the top group and Sub");
         assert_eq!(vault.entry_count(), 2);
         assert_eq!(
-            groups[0].entry_ids.len(),
-            2,
+            groups[0].entry_ids,
+            vec![first.clone(), second.clone()],
             "both entries are back in the top group"
+        );
+        assert_eq!(
+            vault.parent_of(sub),
+            Some(top),
+            "the child group took its parent's place"
+        );
+        assert!(vault.remove_group("0".repeat(32)).is_err(), "the top group");
+    }
+
+    /// An icon crosses the boundary with the entry and survives a round trip through the file.
+    #[test]
+    fn an_icon_crosses_the_boundary() {
+        let (vault, _) = registered_vault("device-a");
+        let icon = FfiEntryIcon {
+            mime: FfiIconMime::Png,
+            bytes: vec![0x89, b'P', b'N', b'G'],
+        };
+        let id = vault
+            .add_entry(
+                FfiVaultEntry {
+                    icon: Some(icon.clone()),
+                    ..sample_entry("with icon")
+                },
+                NOW,
+            )
+            .expect("the entry should be added");
+
+        let read = vault.entry(id.clone()).expect("the entry is there");
+        assert_eq!(read.icon, Some(icon.clone()));
+        let debug = format!("{read:?}");
+        assert!(
+            !debug.contains("137, 80, 78, 71"),
+            "the icon bytes must not reach a log: {debug}"
+        );
+
+        // The icon travels through the file and comes back unchanged.
+        let bytes = vault.serialize().expect("should serialize");
+        let store = Arc::new(TestStore::default());
+        store
+            .store_master_key(vault.lock().master_key().expose().to_vec())
+            .expect("the key is stored");
+        let reopened = FfiVault::open(store, bytes).expect("the file opens");
+        assert_eq!(
+            reopened.entry(id).expect("the entry is there").icon,
+            Some(icon),
+            "the picture survives the file"
         );
     }
 

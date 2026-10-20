@@ -1,6 +1,6 @@
 [package]
 name = "qualia2fa-ffi"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 description = "Qualia2FA FFI layer: exposes qualia2fa-core as UniFFI bindings for Kotlin and Swift"
 license = "LGPL-3.0-or-later"
@@ -45,10 +45,11 @@ crate-type = ["cdylib", "staticlib"]
 #
 # 0.2.1 is the first release that can write an export, and it is also the one whose HTML reader
 # takes the time step out of the QR code an export draws - so the export screen and the import
-# preview of an HTML file both need it. 0.2.2 spells the HTML export's cells the way the
-# implementation that format belongs to spells them, which is what a user's exported file looks
-# like; the floor moves with it so that a build of this crate cannot resolve to 0.2.1.
-qualia2fa-core = "0.2.2"
+# preview of an HTML file both need it. 0.3.0 is the floor because the tree of groups and the
+# icon node only exist there; an FFI build against anything older would not compile at all, and
+# letting the resolver pick an older core would only turn a compile error into a confusing
+# version conflict. Its HTML export still spells the cells the way Aegis does.
+qualia2fa-core = "0.3.0"
 
 # The code channel and the LAN channel. The host draws a pairing payload (or an entry) as a
 # QR code and reads one back from an image the user imported; and the LAN half — multicast

@@ -34,8 +34,9 @@ The following are exported:
 
 - OTP (TOTP / HOTP / mOTP / Yandex OTP / Steam Guard)
 - the vault
-- groups and orderings
-- importing and exporting
+- a tree of groups (parent links, and one order for entries and child groups)
+- icons (passed through as bytes)
+- importing and exporting (six formats, including the two `.q2fa` containers)
 - recovery keys
 - registration/login
 - challenge-response and synchronization
@@ -142,10 +143,11 @@ the file" — the master key never appears in Kotlin/Swift as bytes even once.
 | `removeEntry(id, now)` → `Bool` | Removes one (leaves a tombstone) |
 | `serialize` | Serializes, for the host side to write **atomically** |
 | `codeFor(id, now)` / `hotpFor(id, counter)` | Computes a code from the **entry's kind** |
-| `groups` / `groupOf(id)` | The groups and their orderings (the top group is always first) |
-| `createGroup` / `renameGroup` / `moveGroup` / `removeGroup` | Adds, renames, moves and removes groups (removing one keeps its entries) |
-| `setOrdering` / `assignToGroup` | Writes an ordering (the whole list) and moves an entry into a group |
-| `export(format, password)` | Writes the vault in a format another authenticator reads (see below) |
+| `groups` / `childrenOf(id)` / `parentOf(id)` / `depthOf(id)` | The tree: groups in pre-order, one group's children, the parent and the depth (the top group is always first) |
+| `createGroupIn` / `renameGroup` / `setChildren` / `removeGroup` | Creates under a given parent, renames, writes one whole child list, removes (its children move to the parent) |
+| `setOrdering` / `assignToGroup` | Reorders only the entries of one group, and moves an entry into a group (uses of `setChildren` on a subset) |
+| `export(format, password)` | Writes one of six formats (the two `.q2fa` containers and the four external ones) |
+| `detectPortableFile` / `openPortableFile` / `FfiPortableRestore` | Recognises and restores `.q2fa` (old key-only files included), rolling the master key back on failure |
 | `exportRecoveryKey(passphrase, …)` | Exports a recovery key file |
 
 `updateEntry` and `removeEntry` differ by more than semantics: an update keeps the entry's
@@ -170,10 +172,10 @@ duplicate they can delete.
 ### Exporting (`FfiVault.export`)
 
 `vault.export(format, password)` writes the whole vault and returns the file's bytes: **this layer
-does no I/O**, so where they go is the host side's save dialog. The four formats mirror the import
+does no I/O**, so where they go is the host side's save dialog. The two `.q2fa` containers (`Vault` with the master key in clear, `EncryptedVault` with it wrapped by a passphrase) restore the whole account - entries, the group tree and the icons. The four external formats mirror the import
 exactly: `Text` (one URI per line), `Json`, `EncryptedJson` and `Html` (a QR code drawn for every
 entry). Three functions answer what the interface has to ask while the user picks a format:
-`exportFormatNeedsPassword`, `exportFormatExtension`, and `exportFormatCarriesGroups` (whether the
+`exportFormatNeedsPassword`, `exportFormatExtension`, `exportFormatCarriesGroups`, and `exportFormatGroupCarrying` (`None` / `FlatGroups` / `FullTree`; whether the
 groups and their order travel - **only the two JSON forms carry them**).
 
 **Only `EncryptedJson` protects anything.** The other three are as sensitive as the vault itself:
@@ -414,6 +416,15 @@ Three things a caller has to know:
 > **unauthenticated** — it only answers "who is probably on this segment, and where to reach
 > them"; the connection handshake proves the identity, and the core decides from the device
 > identifier whether a payload may be accepted.
+
+### Breaking changes in 0.3.0
+
+- **Depends on `qualia2fa-core 0.3.0`**: vault format **4** and sync payload **4**, so it cannot sync with 0.2.x;
+  older vaults are still read, and an older peer gets a clear version error.
+- **Groups are a tree**: `FfiGroup` no longer has `order` and gains `children` (`FfiGroupChild`: entry or group);
+  `moveGroup` is replaced by `setChildren` / `createGroupIn`. A conflict's `local` / `incoming` are child lists too.
+- **Entries gain `icon`** (`FfiEntryIcon`: format plus raw bytes); exporting gains two `.q2fa` formats and
+  `FfiGroupCarrying`.
 
 ### Breaking changes in 0.2.0
 

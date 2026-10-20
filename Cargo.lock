@@ -2690,9 +2690,9 @@ dependencies = [
 
 [[package]]
 name = "qualia2fa-core"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a83dd5cfd509e5d69b336ee4c682fa7553e33c132d7ecd61188ffc9dff7f3d71"
+checksum = "f152ff18c88ca78236fcfcb987a58631fa44dc7641cac8aa6fba148439288296"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -2717,7 +2717,7 @@ dependencies = [
 
 [[package]]
 name = "qualia2fa-ffi"
-version = "0.2.4"
+version = "0.3.0"
 dependencies = [
  "p256",
  "qualia-dik",
