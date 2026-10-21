@@ -146,9 +146,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          cat > notes.md <<NOTES
+          \`qualia2fa-ffi\` $GITHUB_REF_NAME 已发布到 crates.io。
+
+          ---
+
+          \`qualia2fa-ffi\` $GITHUB_REF_NAME is published on crates.io.
+          NOTES
           if gh release create "$GITHUB_REF_NAME" \
                --title "$GITHUB_REF_NAME" \
-               --notes "Published to crates.io as \`qualia2fa-ffi\`." \
+               --notes-file notes.md \
                --verify-tag; then
             echo "Created GitHub Release $GITHUB_REF_NAME"
           else
