@@ -1,0 +1,24 @@
+Qualia2FA-FFI
+Copyright (C) 2026 Qualia2FA contributors
+Source: https://github.com/Qualia2FA/Qualia2FA-FFI
+
+This library is free software; you can redistribute it and/or modify it under
+the terms of the GNU Lesser General Public License as published by the Free
+Software Foundation; either version 3 of the License, or (at your option) any
+later version.
+
+This library is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for more
+details.
+
+The complete license texts are COPYING.LESSER (GNU Lesser General Public
+License version 3) and LICENSE (GNU General Public License version 3, which the
+Lesser license incorporates by reference).
+
+This library depends on the following Qualia2FA components, distributed under
+the same license:
+
+  qualia2fa-core     LGPL-3.0-or-later    https://github.com/Qualia2FA/Qualia2FA-Core
+  qualia-dik         LGPL-3.0-or-later    https://github.com/Qualia2FA/QualiaDeviceIdentityKit
+  qualia-transport   LGPL-3.0-or-later    https://github.com/Qualia2FA/QualiaTransport
