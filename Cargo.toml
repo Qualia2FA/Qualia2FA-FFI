@@ -1,12 +1,12 @@
 [package]
 name = "qualia2fa-ffi"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Qualia2FA FFI layer: exposes qualia2fa-core as UniFFI bindings for Kotlin and Swift"
 license = "LGPL-3.0-or-later"
 rust-version = "1.89"
 repository = "https://github.com/Qualia2FA/Qualia2FA-FFI"
-readme = "README.md"
+readme = "README.en.md"
 # CI configuration and the dependency audit manifest are not part of the published
 # package: they are meaningless to users, and the size and contents of a crates.io
 # package are publicly visible.

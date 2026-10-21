@@ -2,7 +2,7 @@
 
 # Qualia2FA-FFI
 
-[简体中文](README.md) | English
+[简体中文](https://github.com/Qualia2FA/Qualia2FA-FFI/blob/master/README.md) | English
 
 Exposes [`qualia2fa-core`](https://github.com/Qualia2FA/Qualia2FA-Core) as
 [UniFFI](https://mozilla.github.io/uniffi-rs/) bindings, for managed languages such as
@@ -12,7 +12,7 @@ Kotlin and Swift to call.
 [![Releases](https://img.shields.io/github/downloads/Qualia2FA/Qualia2FA-FFI/total?logo=github&label=Downloads)][Releases]
 [![crates.io](https://img.shields.io/crates/d/qualia2fa-ffi?logo=crates.io&label=crates.io+Downloads)][crates.io]
 
-[License]: LICENSE
+[License]: https://github.com/Qualia2FA/Qualia2FA-FFI/blob/master/LICENSE
 
 [Releases]: https://github.com/Qualia2FA/Qualia2FA-FFI/releases
 
@@ -596,4 +596,4 @@ published on crates.io, so no upstream directory is checked out and there is no 
 
 ## License
 
-LGPL-3.0-or-later, see [`LICENSE`](LICENSE) and [`COPYING.LESSER`](COPYING.LESSER).
+LGPL-3.0-or-later, see [`LICENSE`](https://github.com/Qualia2FA/Qualia2FA-FFI/blob/master/LICENSE) and [`COPYING.LESSER`](https://github.com/Qualia2FA/Qualia2FA-FFI/blob/master/COPYING.LESSER).
