@@ -2689,9 +2689,9 @@ dependencies = [
 
 [[package]]
 name = "qualia-transport"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30a6c025ce0def7ee18915f0b6907ffdbff9e1ad7f591b0d469a0e5c4a30e088"
+checksum = "2bd290725d62109ac2c42ddd312e218c18e4987a1c19d0081305327fa7665f36"
 dependencies = [
  "if-addrs",
  "iroh",
@@ -2705,9 +2705,9 @@ dependencies = [
 
 [[package]]
 name = "qualia2fa-core"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "721b0c4569c1ee71f036921bbe8dff8581f0e25ca42755fcd19faacbabb0f6cc"
+checksum = "e6954785976458f27c1d2a00402d5c7b93fb67588097dbc5907be70e77035406"
 dependencies = [
  "aes-gcm 0.11.1",
  "argon2",
@@ -2732,7 +2732,7 @@ dependencies = [
 
 [[package]]
 name = "qualia2fa-ffi"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "p256",
  "qualia-bioauth",
