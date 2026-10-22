@@ -1,6 +1,6 @@
 [package]
 name = "qualia2fa-ffi"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 description = "Qualia2FA FFI layer: exposes qualia2fa-core as UniFFI bindings for Kotlin and Swift"
 license = "LGPL-3.0-or-later"
@@ -49,7 +49,7 @@ crate-type = ["cdylib", "staticlib"]
 # icon node only exist there; an FFI build against anything older would not compile at all, and
 # letting the resolver pick an older core would only turn a compile error into a confusing
 # version conflict. Its HTML export still spells the cells the way Aegis does.
-qualia2fa-core = "0.3.0"
+qualia2fa-core = "0.4.0"
 
 # The code channel and the LAN channel. The host draws a pairing payload (or an entry) as a
 # QR code and reads one back from an image the user imported; and the LAN half — multicast
@@ -91,6 +91,13 @@ qualia-transport = { version = "0.1.3", features = ["iroh-lan"] }
 # The crate is published on crates.io, which puts local, CI and third-party
 # consumers on the same source. Both this crate and Core depend on it directly.
 qualia-dik = "0.1.3"
+
+# Platform auth-bound key store: the second unlock path (`master.key.bio`).
+#
+# A version requirement, like the two above: the crate is published on crates.io,
+# so local, CI and third-party consumers resolve the same source. 0.1.0 is the first
+# release carrying the Windows backend and the host-sealer seam the application uses.
+qualia-bioauth = "0.1.0"
 
 # Provides the `Display` and `std::error::Error` implementations of `FfiError`.
 # Same major as the version Core uses (2.0.21), so no duplicate version.
@@ -136,3 +143,4 @@ sha2 = "0.11"
 # production build cannot carry a key store path with no hardware protection,
 # and the library targets of this crate never enable it.
 qualia-dik = { version = "0.1.3", features = ["mock"] }
+

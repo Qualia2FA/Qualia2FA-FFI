@@ -1,0 +1,26 @@
+feat!: expose the unlock wrap and the platform authentication seam
+
+The application lock needs three things from this boundary: a password wrap
+it can write beside the vault, the marker and pending state files, and the
+platform-authenticated wrap whose platform half lives in the application.
+
+wrap_master_key_with_password and unwrap_master_key_with_password keep the
+master key inside the Rust side; unwrap hands it back only because opening a
+vault requires it, and the host erases its copy immediately. Argon2id runs
+without holding the vault lock, so a password change or an unlock does not
+freeze a concurrent read.
+
+rewrap_lock_password checks the old password against the old wrap *and*
+against the open vault's master key: a wrap from another account would
+otherwise produce a new wrap for a key this vault cannot use.
+
+FfiAuthBoundKeyStore::with_host is the Android seam. A BiometricPrompt
+belongs to an Activity, and using an auth-bound Keystore key requires one,
+so no library can host it. The host supplies the sealing calls through
+FfiPlatformSealer and this crate keeps the envelope, the backend identifier,
+the 32-byte length and the error vocabulary; a cancelled gesture stays
+AuthenticationFailed across the boundary because the caller says something
+different for it.
+
+BREAKING CHANGE: qualia2fa-core is now 0.4.0 and qualia-bioauth 0.1.0, and
+this crate's own version follows to 0.4.0.

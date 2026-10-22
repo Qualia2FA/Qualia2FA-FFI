@@ -60,6 +60,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use qualia_bioauth as bioauth;
+use qualia_bioauth::Backend;
 use qualia_dik::keystore::PlatformKeyStore;
 use qualia_dik::keystore::platform::{PlatformDirectMasterKeyStore, PlatformWrappedMasterKeyStore};
 use qualia_dik::{
@@ -311,6 +313,18 @@ pub fn core_error_kind(source: &Error) -> &'static str {
         Error::RecoveryAuthenticationFailed => "recovery_authentication_failed",
         Error::RecoveryEncryptionFailed => "recovery_encryption_failed",
         Error::RecoveryKdfFailed => "recovery_kdf_failed",
+        // ── The application lock's password wrap ────────────────────────────
+        //
+        // Each failure sends the unlock screen somewhere different: a file that is not a
+        // lock wrap is a state to report (restore or reset), a password that does not open
+        // it is a retry, and a damaged cost field is neither. They must not collapse into
+        // `"unknown"`.
+        Error::LockFileMalformed { .. } => "lock_file_malformed",
+        Error::LockParametersInvalid { .. } => "lock_parameters_invalid",
+        Error::LockPassphraseEmpty => "lock_passphrase_empty",
+        Error::LockPasswordRejected => "lock_password_rejected",
+        Error::LockEncryptionFailed => "lock_encryption_failed",
+        Error::LockKdfFailed => "lock_kdf_failed",
         Error::UnsupportedFormatVersion { .. } => "unsupported_format_version",
         Error::AuthMessageMalformed { .. } => "auth_message_malformed",
         Error::AuthProofFailed => "auth_proof_failed",
@@ -402,6 +416,7 @@ impl FfiError {
             FfiError::Core { detail } => &detail.kind,
             FfiError::Qr { kind, .. } => kind,
             FfiError::Lan { kind, .. } => kind,
+            FfiError::AuthBound { kind, .. } => kind,
             FfiError::InvalidDeviceId { .. } => "invalid_device_id",
             FfiError::UnknownConflict { .. } => "unknown_conflict",
         }
@@ -519,6 +534,19 @@ pub enum FfiError {
         /// Stable kind for the host to branch on, in `snake_case`.
         kind: String,
         /// Human-readable detail. Never contains a payload or a secret.
+        detail: String,
+    },
+
+    /// An error from the platform auth-bound key store behind `master.key.bio`.
+    ///
+    /// Separate from [`FfiError::Core`] because the platform authentication path has its
+    /// own failure modes (a cancelled gesture, an unavailable authenticator, a blob written
+    /// by another backend), and the host has to tell them apart from vault errors.
+    #[error("{detail}")]
+    AuthBound {
+        /// Stable kind for the host to branch on, in `snake_case`.
+        kind: String,
+        /// Human-readable detail. Never contains a key or a blob.
         detail: String,
     },
 
@@ -1582,6 +1610,7 @@ fn ffi_to_core_error(source: FfiError) -> Error {
         | FfiError::Qr { .. }
         | FfiError::Lan { .. }
         | FfiError::InvalidDeviceId { .. }
+        | FfiError::AuthBound { .. }
         | FfiError::UnknownConflict { .. } => Error::DeviceKeyMissing,
     }
 }
@@ -2128,6 +2157,430 @@ impl FfiWrappedMasterKeyStore {
     }
 }
 
+/// What the platform's auth-bound key store can do, asked before offering the path.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiAuthAvailability {
+    /// The platform can create and use an authentication-bound key.
+    Available {
+        /// Stable backend name (`windows-webauthn`, `android-keystore`, ...).
+        backend: String,
+        /// Whether the platform reported hardware protection. Never guessed.
+        hardware_backed: bool,
+    },
+    /// The mechanism exists, but this machine or user cannot use it right now.
+    Unavailable {
+        /// Why the platform refused; fixed text from the backend.
+        reason: String,
+    },
+    /// This build has no backend for the platform.
+    Unsupported {
+        /// Why no backend exists; fixed text from the fallback.
+        reason: String,
+    },
+}
+
+/// The platform auth-bound key store used by `master.key.bio`.
+///
+/// The master key crosses this boundary as a `Vec<u8>` only where the host has no other
+/// option: [`FfiVault::wrap_master_for_auth_bound`] keeps the key inside the vault, and the
+/// login path needs the unwrapped key to open the vault at all. The bytes are erased on the
+/// Rust side after use; the host-side copy is the caller's responsibility.
+#[derive(uniffi::Object)]
+pub struct FfiAuthBoundKeyStore {
+    /// The platform store, held as the interface so the host sees one object on every
+    /// platform, including the unsupported fallback.
+    store: Box<dyn bioauth::AuthBoundKeyStore>,
+}
+
+#[uniffi::export]
+impl FfiAuthBoundKeyStore {
+    /// Builds a store over a host-supplied platform sealer.
+    ///
+    /// `backend` names the mechanism the host uses: `android-keystore` or
+    /// `apple-secure-enclave`. It is written into every blob, so it must describe what the
+    /// host actually did; a blob records it and a mismatch is refused on the way in.
+    ///
+    /// # Errors
+    ///
+    /// `bioauth_unknown_backend` when the name is not one this build knows.
+    #[uniffi::constructor]
+    pub fn with_host(
+        sealer: Arc<dyn FfiPlatformSealer>,
+        backend: String,
+    ) -> Result<Arc<Self>, FfiError> {
+        let backend = backend_from_name(&backend)?;
+        Ok(Arc::new(Self {
+            store: Box::new(bioauth::DelegatingKeyStore::new(Arc::new(HostSealer {
+                host: sealer,
+                backend,
+            }))),
+        }))
+    }
+
+    /// Opens the auth-bound key store of the current platform.
+    ///
+    /// Opening never fails: a platform without a backend returns an object whose
+    /// [`FfiAuthBoundKeyStore::availability`] is `unsupported`, which lets the host show
+    /// the truth instead of a "could not open" error.
+    #[uniffi::constructor]
+    pub fn open() -> Arc<Self> {
+        Arc::new(Self {
+            store: bioauth::platform::open_best_available(),
+        })
+    }
+
+    /// Reports what this store can do, without prompting.
+    #[must_use]
+    pub fn availability(&self) -> FfiAuthAvailability {
+        match self.store.availability() {
+            bioauth::Availability::Available {
+                backend,
+                hardware_backed,
+            } => FfiAuthAvailability::Available {
+                backend: backend.name().to_owned(),
+                hardware_backed,
+            },
+            bioauth::Availability::Unavailable { reason } => FfiAuthAvailability::Unavailable {
+                reason: reason.to_owned(),
+            },
+            bioauth::Availability::Unsupported { reason } => FfiAuthAvailability::Unsupported {
+                reason: reason.to_owned(),
+            },
+        }
+    }
+
+    /// Creates the platform credential or key, prompting if the platform requires it.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::AuthBound`] with the backend's kind; `bioauth_authentication_failed`
+    /// when the user cancelled, `bioauth_unavailable` when the platform is not usable.
+    pub fn create(&self) -> Result<(), FfiError> {
+        self.store.create().map_err(auth_bound_error)
+    }
+
+    /// Wraps `master_key` and returns the complete blob for `master.key.bio`.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::AuthBound`] for a cancelled gesture or an unavailable platform;
+    /// `bioauth_master_key_wrong_length` when the key is not 32 bytes.
+    pub fn wrap(&self, master_key: Vec<u8>) -> Result<Vec<u8>, FfiError> {
+        let master = bioauth::MasterKey::from_bytes(&master_key).map_err(auth_bound_error)?;
+        self.store.wrap(&master).map_err(auth_bound_error)
+    }
+
+    /// Authenticates the user and returns the master key from `blob`.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::AuthBound`] with `bioauth_authentication_failed` for a cancelled
+    /// gesture, `bioauth_wrong_backend` for a blob written by another backend, and
+    /// `bioauth_wrapped_payload_invalid` for a damaged blob.
+    pub fn unwrap(&self, blob: Vec<u8>) -> Result<Vec<u8>, FfiError> {
+        let master = self.store.unwrap(&blob).map_err(auth_bound_error)?;
+        Ok(master.expose_secret().to_vec())
+    }
+
+    /// Deletes the platform key or credential this store remembers.
+    pub fn delete(&self) -> Result<(), FfiError> {
+        self.store.delete().map_err(auth_bound_error)
+    }
+
+    /// Deletes the platform credential named by `blob`.
+    ///
+    /// Used when the host turns the second path off after a restart and no longer has the
+    /// credential id in memory. The blob is checked against this backend before anything is
+    /// deleted, so a copied Windows blob does not delete an unrelated Android key.
+    pub fn delete_blob(&self, blob: Vec<u8>) -> Result<(), FfiError> {
+        self.store.delete_blob(&blob).map_err(auth_bound_error)
+    }
+}
+
+impl FfiAuthBoundKeyStore {
+    /// Wraps a store for tests, which need a backend whose answers are fixed.
+    #[cfg(test)]
+    fn with_store(store: Box<dyn bioauth::AuthBoundKeyStore>) -> Arc<Self> {
+        Arc::new(Self { store })
+    }
+}
+
+/// The platform half of `master.key.bio`, implemented by the host application.
+///
+/// Android cannot be served from Rust: an auth-bound key lives in the Android Keystore and
+/// using it needs a `BiometricPrompt` attached to an Activity's UI thread, which a library
+/// cannot host. The host therefore supplies the sealing calls, and this crate keeps the
+/// envelope, the backend identifier and the length checks.
+///
+/// Implementations may prompt and may block until the user has authenticated.
+#[uniffi::export(with_foreign)]
+pub trait FfiPlatformSealer: Send + Sync {
+    /// The backend these bytes belong to: `android-keystore` or `apple-secure-enclave`.
+    fn backend(&self) -> String;
+
+    /// Reports whether sealing is possible right now, without prompting.
+    fn availability(&self) -> FfiAuthAvailability;
+
+    /// Seals 32 bytes of key material, prompting if the platform requires it.
+    fn seal(&self, plaintext: Vec<u8>) -> Result<Vec<u8>, FfiError>;
+
+    /// Authenticates the user and returns the plaintext.
+    ///
+    /// A cancelled gesture is an error, never a buffer of zeros.
+    fn unseal(&self, envelope: Vec<u8>) -> Result<Vec<u8>, FfiError>;
+
+    /// Deletes the platform key. Idempotent.
+    fn delete(&self) -> Result<(), FfiError>;
+}
+
+/// Adapts a host [`FfiPlatformSealer`] to the crate's own seam.
+///
+/// The adapter is where the two error vocabularies meet: a cancelled gesture has to stay
+/// `AuthenticationFailed` across the boundary, because the caller shows a different message
+/// for "the user pressed cancel" than for "the platform is broken".
+impl core::fmt::Debug for HostSealer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("HostSealer")
+    }
+}
+
+struct HostSealer {
+    /// The host's implementation.
+    host: Arc<dyn FfiPlatformSealer>,
+    /// The backend the host declared, checked once when the store is built.
+    backend: Backend,
+}
+
+/// Maps the boundary error back into the crate's vocabulary.
+fn host_error(error: FfiError) -> bioauth::Error {
+    match error.kind() {
+        "bioauth_authentication_failed" => bioauth::Error::AuthenticationFailed,
+        "bioauth_wrapped_payload_invalid" => bioauth::Error::WrappedPayloadInvalid {
+            reason: "the host could not authenticate the envelope",
+        },
+        "bioauth_unavailable" => bioauth::Error::Unavailable {
+            reason: "the platform cannot authenticate right now",
+        },
+        _ => bioauth::Error::Platform {
+            operation: "host platform sealer",
+            code: 0,
+        },
+    }
+}
+
+impl bioauth::PlatformSealer for HostSealer {
+    fn backend(&self) -> Backend {
+        self.backend
+    }
+
+    fn availability(&self) -> bioauth::Availability {
+        match self.host.availability() {
+            FfiAuthAvailability::Available {
+                backend: _,
+                hardware_backed,
+            } => bioauth::Availability::Available {
+                backend: self.backend,
+                hardware_backed,
+            },
+            FfiAuthAvailability::Unavailable { reason } => bioauth::Availability::Unavailable {
+                reason: leak_reason(&reason),
+            },
+            FfiAuthAvailability::Unsupported { reason } => bioauth::Availability::Unsupported {
+                reason: leak_reason(&reason),
+            },
+        }
+    }
+
+    fn seal(&self, plaintext: &[u8]) -> bioauth::Result<Vec<u8>> {
+        self.host
+            .seal(plaintext.to_vec())
+            .map_err(host_error)
+            .and_then(|sealed| {
+                if sealed.is_empty() {
+                    Err(bioauth::Error::PayloadEmpty)
+                } else {
+                    Ok(sealed)
+                }
+            })
+    }
+
+    fn unseal(&self, envelope: &[u8]) -> bioauth::Result<Vec<u8>> {
+        self.host.unseal(envelope.to_vec()).map_err(host_error)
+    }
+
+    fn delete(&self) -> bioauth::Result<()> {
+        self.host.delete().map_err(host_error)
+    }
+}
+
+/// Interns a host-supplied reason so the crate's `&'static str` reasons can carry it.
+///
+/// The crate's reasons are static strings because they are fixed messages; a host reason
+/// comes from the platform. Leaking is bounded by the number of distinct platform answers,
+/// which is a handful per process, and the alternative would be to drop the platform's own
+/// words from the report.
+fn leak_reason(reason: &str) -> &'static str {
+    if reason.is_empty() {
+        return "the platform reported no reason";
+    }
+    Box::leak(reason.to_owned().into_boxed_str())
+}
+
+/// Reads the backend a host declares, rejecting a name this build does not know.
+fn backend_from_name(name: &str) -> Result<Backend, FfiError> {
+    match name {
+        "android-keystore" => Ok(Backend::AndroidKeystore),
+        "apple-secure-enclave" => Ok(Backend::AppleSecureEnclave),
+        other => Err(FfiError::AuthBound {
+            kind: "bioauth_unknown_backend".to_owned(),
+            detail: format!("{other} is not a backend a host may supply"),
+        }),
+    }
+}
+
+/// Maps a `qualia_bioauth` error to the FFI error.
+fn auth_bound_error(error: bioauth::Error) -> FfiError {
+    use bioauth::Error as E;
+    let kind = match &error {
+        E::Malformed { .. } => "bioauth_malformed",
+        E::UnsupportedVersion { .. } => "bioauth_unsupported_version",
+        E::UnknownBackend { .. } => "bioauth_unknown_backend",
+        E::WrongBackend { .. } => "bioauth_wrong_backend",
+        E::PayloadTooLong { .. } => "bioauth_payload_too_long",
+        E::PayloadEmpty => "bioauth_payload_empty",
+        E::MasterKeyWrongLength { .. } => "bioauth_master_key_wrong_length",
+        E::Unavailable { .. } => "bioauth_unavailable",
+        E::AuthenticationFailed => "bioauth_authentication_failed",
+        E::WrappedPayloadInvalid { .. } => "bioauth_wrapped_payload_invalid",
+        E::Platform { .. } => "bioauth_platform",
+        E::RandomnessUnavailable => "bioauth_randomness_unavailable",
+        E::MockAuthenticationFailed => "bioauth_mock_authentication_failed",
+        _ => "bioauth_unknown",
+    };
+    FfiError::AuthBound {
+        kind: kind.to_owned(),
+        detail: error.to_string(),
+    }
+}
+
+/// Length of a password-wrapped master key (`master.key.pw`).
+///
+/// The host side writes the file the wrap returns; the length is exposed so that a
+/// reader can reject a wrong-sized file before calling the unwrap function, which has to
+/// run Argon2id.
+#[uniffi::export]
+#[must_use]
+pub fn lock_wrap_len() -> u64 {
+    qualia2fa_core::LOCK_WRAP_LEN as u64
+}
+
+/// Wraps a 32-byte master key with the unlock password.
+///
+/// The returned bytes are `master.key.pw`: the complete file, magic and all. The host
+/// side writes them next to the vault. The master key must be 32 bytes, the same
+/// boundary [`FfiVault::from_master_key`] uses.
+///
+/// # Errors
+///
+/// - a master key of the wrong length: `master_key_wrong_length`
+/// - an empty password: `lock_passphrase_empty`
+/// - an oversized password: [`FfiError::InputTooLong`]
+/// - a derivation failure: `lock_kdf_failed`
+/// - an encryption failure: `lock_encryption_failed`
+#[uniffi::export]
+pub fn wrap_master_key_with_password(
+    master_key: Vec<u8>,
+    password: String,
+) -> Result<Vec<u8>, FfiError> {
+    check_len("password", &password, MAX_PASSPHRASE_CHARS)?;
+    let master = flow::master_key_from_bytes(master_key.into())?;
+    let passphrase = SecretString::from(password);
+    qualia2fa_core::lock::wrap(&master, &passphrase, &KdfParams::recommended()).map_err(Into::into)
+}
+
+/// Opens a password-wrapped master key and returns the 32-byte key.
+///
+/// The caller hands the returned bytes to an in-memory [`FfiSecureStore`] and then calls
+/// [`FfiVault::open`]. The bytes are the master key itself, so the host side must wipe
+/// its copy as soon as the vault object exists.
+///
+/// # Errors
+///
+/// - a malformed file: `lock_file_malformed`
+/// - an unsupported version or algorithm: `unsupported_format_version`
+/// - parameters out of range: `lock_parameters_invalid`
+/// - an empty password: `lock_passphrase_empty`
+/// - a wrong password or tampered file: `lock_password_rejected`
+/// - a derivation failure: `lock_kdf_failed`
+///
+/// `lock_password_rejected` merges "wrong password" and "file modified" on purpose; the
+/// unlock screen shows the same message for both.
+#[uniffi::export]
+pub fn unwrap_master_key_with_password(
+    wrapped: Vec<u8>,
+    password: String,
+) -> Result<Vec<u8>, FfiError> {
+    check_len("password", &password, MAX_PASSPHRASE_CHARS)?;
+    let passphrase = SecretString::from(password);
+    let master = qualia2fa_core::lock::unwrap(&wrapped, &passphrase)?;
+    Ok(flow::master_key_to_bytes(&master).expose_secret().to_vec())
+}
+
+/// Builds the `lock.marker` contents.
+///
+/// The marker records that the lock is enabled, which wraps existed when it was written and
+/// when the migration finished. It contains no secret; its flags are advisory and the
+/// application must still look at the actual wrap files.
+///
+/// # Errors
+///
+/// - neither wrap present: `lock_file_malformed`
+/// - `migrated_at` of zero: `timestamp_zero`
+#[uniffi::export]
+pub fn lock_marker(password: bool, biometric: bool, migrated_at: u64) -> Result<Vec<u8>, FfiError> {
+    Ok(qualia2fa_core::LockMarker::new(password, biometric, migrated_at)?.encode())
+}
+
+/// Builds the `lock.pending` contents.
+///
+/// Its presence means a creation, migration or recovery is in progress and the next start
+/// must finish or roll back. It contains no secret.
+///
+/// # Errors
+///
+/// A zero `started_at`: `timestamp_zero`.
+#[uniffi::export]
+pub fn lock_pending(started_at: u64) -> Result<Vec<u8>, FfiError> {
+    Ok(qualia2fa_core::LockPending::new(started_at)?.encode())
+}
+
+/// Whether `bytes` are a valid `lock.marker`.
+///
+/// A marker that cannot be read is **not** a legacy installation: the caller must fail
+/// closed instead of opening the vault without a password.
+#[uniffi::export]
+#[must_use]
+pub fn is_lock_marker(bytes: Vec<u8>) -> bool {
+    qualia2fa_core::LockMarker::parse(&bytes).is_ok()
+}
+
+/// Whether `bytes` are a valid `lock.pending`.
+#[uniffi::export]
+#[must_use]
+pub fn is_lock_pending(bytes: Vec<u8>) -> bool {
+    qualia2fa_core::LockPending::parse(&bytes).is_ok()
+}
+
+/// Whether `bytes` are a structurally valid password wrap, without running Argon2id.
+///
+/// This is the cheap "is there a usable password path on this device" question. It does not
+/// prove the password is known; only [`unwrap_master_key_with_password`] does.
+#[uniffi::export]
+#[must_use]
+pub fn is_lock_password_wrap(bytes: Vec<u8>) -> bool {
+    qualia2fa_core::lock::WrapHeader::parse(&bytes).is_ok()
+}
+
 /// Opens the direct master key store of the current platform.
 ///
 /// The `cfg` split is the one [`open_platform_key_store`] documents: opening a platform
@@ -2622,6 +3075,66 @@ impl FfiVault {
     pub fn from_master_key(master_key: Vec<u8>) -> Result<Arc<Self>, FfiError> {
         let master = flow::master_key_from_bytes(master_key.into())?;
         Ok(Self::wrap(flow::empty_vault(master)))
+    }
+
+    /// Re-wraps this vault's master key with a new unlock password.
+    ///
+    /// The old password is checked against `old_wrap` **and** against this vault's master key
+    /// before a new wrap is produced. The caller writes the returned bytes atomically over
+    /// `master.key.pw`; if the write fails, the old wrap is still there.
+    ///
+    /// The master key bytes are copied under the vault lock, and Argon2id runs after the lock
+    /// is released, so a concurrent screen refresh is not held up by the derivation.
+    ///
+    /// # Errors
+    ///
+    /// - a malformed `old_wrap`: `lock_file_malformed` / `unsupported_format_version` /
+    ///   `lock_parameters_invalid`
+    /// - a wrong old password, or one for another account: `lock_password_rejected`
+    /// - an empty password: `lock_passphrase_empty`
+    /// - an oversized password: [`FfiError::InputTooLong`]
+    /// - a derivation or encryption failure: `lock_kdf_failed` / `lock_encryption_failed`
+    pub fn rewrap_lock_password(
+        &self,
+        old_wrap: Vec<u8>,
+        old_password: String,
+        new_password: String,
+    ) -> Result<Vec<u8>, FfiError> {
+        check_len("old_password", &old_password, MAX_PASSPHRASE_CHARS)?;
+        check_len("new_password", &new_password, MAX_PASSPHRASE_CHARS)?;
+        let old = SecretString::from(old_password);
+        let new = SecretString::from(new_password);
+
+        let master = {
+            let file = self.lock();
+            MasterKey::from_bytes(flow::master_key_to_bytes(file.master_key()))?
+        };
+        let opened = qualia2fa_core::lock::unwrap(&old_wrap, &old)?;
+        if !opened.matches(&master) {
+            return Err(Error::LockPasswordRejected.into());
+        }
+        qualia2fa_core::lock::wrap(&master, &new, &KdfParams::recommended()).map_err(Into::into)
+    }
+
+    /// Wraps this vault's master key with the platform auth-bound store.
+    ///
+    /// The key bytes are copied under the vault lock and the platform prompt runs after the
+    /// lock is released, so a Hello or biometric prompt does not freeze other vault calls.
+    /// The returned bytes are the complete `master.key.bio` blob.
+    ///
+    /// # Errors
+    ///
+    /// [`FfiError::AuthBound`] for a cancelled gesture, an unavailable platform, or a
+    /// platform failure. The master key is never returned to the host by this method.
+    pub fn wrap_master_for_auth_bound(
+        &self,
+        store: Arc<FfiAuthBoundKeyStore>,
+    ) -> Result<Vec<u8>, FfiError> {
+        let master = {
+            let file = self.lock();
+            bioauth::MasterKey::from_bytes(file.master_key().expose()).map_err(auth_bound_error)?
+        };
+        store.store.wrap(&master).map_err(auth_bound_error)
     }
 
     /// Registers a new device: generates a master key, obtains a device
@@ -6188,6 +6701,15 @@ mod tests {
             core_error_kind(&Error::DeviceIdentityMismatch),
             core_error_kind(&Error::PairingAuthenticationFailed),
             core_error_kind(&Error::RecoveryAuthenticationFailed),
+            // The unlock password wrap. A malformed file, a rejected password, an empty
+            // password and a damaged cost field are four different answers for the unlock
+            // screen, so each needs its own kind.
+            core_error_kind(&Error::LockFileMalformed { reason: "test" }),
+            core_error_kind(&Error::LockParametersInvalid { reason: "test" }),
+            core_error_kind(&Error::LockPassphraseEmpty),
+            core_error_kind(&Error::LockPasswordRejected),
+            core_error_kind(&Error::LockEncryptionFailed),
+            core_error_kind(&Error::LockKdfFailed),
             core_error_kind(&Error::AuthProofFailed),
             core_error_kind(&Error::TimestampZero),
             core_error_kind(&Error::SyncAlreadyApplied),
@@ -8304,5 +8826,275 @@ mod tests {
         lobby.shutdown();
 
         channel.shutdown();
+    }
+
+    /// The password wrap round trips across the boundary and reports a wrong password.
+    #[test]
+    fn lock_password_wrap_roundtrips() {
+        let master = MasterKey::generate().expect("randomness should be available");
+        let master_bytes = flow::master_key_to_bytes(&master).expose_secret().to_vec();
+
+        let file = wrap_master_key_with_password(master_bytes.clone(), "correct horse".to_owned())
+            .expect("wrapping should succeed");
+        assert_eq!(
+            file.len() as u64,
+            lock_wrap_len(),
+            "the exposed length must match what the wrap returns"
+        );
+
+        let restored = unwrap_master_key_with_password(file.clone(), "correct horse".to_owned())
+            .expect("the right password must open it");
+        assert_eq!(restored, master_bytes);
+
+        let error = unwrap_master_key_with_password(file, "wrong password".to_owned())
+            .expect_err("a wrong password must be rejected");
+        assert_eq!(error.kind(), "lock_password_rejected");
+    }
+
+    /// Empty and oversized passwords are rejected at the boundary.
+    #[test]
+    fn lock_password_limits_are_enforced() {
+        let master = MasterKey::generate().expect("randomness should be available");
+        let master_bytes = flow::master_key_to_bytes(&master).expose_secret().to_vec();
+
+        let error = wrap_master_key_with_password(master_bytes.clone(), String::new())
+            .expect_err("an empty password must be rejected");
+        assert_eq!(error.kind(), "lock_passphrase_empty");
+
+        let oversized = "x".repeat(MAX_PASSPHRASE_CHARS + 1);
+        let error = wrap_master_key_with_password(master_bytes, oversized)
+            .expect_err("an oversized password must be rejected");
+        assert_eq!(error.kind(), "input_too_long");
+    }
+
+    /// The state helpers build and recognize the two marker files.
+    #[test]
+    fn lock_state_files_roundtrip() {
+        let marker = lock_marker(true, false, 1_700_000_000).expect("marker");
+        assert!(is_lock_marker(marker.clone()));
+        assert!(!is_lock_marker(vec![0_u8; 19]));
+
+        let pending = lock_pending(1_700_000_000).expect("pending");
+        assert!(is_lock_pending(pending.clone()));
+        assert!(!is_lock_pending(vec![0_u8; 18]));
+
+        assert!(
+            lock_marker(false, false, 1).is_err(),
+            "a marker that names no wrap must be rejected"
+        );
+        assert!(lock_pending(0).is_err(), "a zero time must be rejected");
+    }
+
+    /// A password wrap is recognizable without running Argon2id.
+    #[test]
+    fn lock_password_wrap_is_recognized_without_the_kdf() {
+        let master = MasterKey::generate().expect("randomness should be available");
+        let master_bytes = flow::master_key_to_bytes(&master).expose_secret().to_vec();
+        let file = wrap_master_key_with_password(master_bytes, "correct horse".to_owned())
+            .expect("wrapping should succeed");
+
+        assert!(is_lock_password_wrap(file.clone()));
+        assert!(!is_lock_password_wrap(file[..file.len() - 1].to_vec()));
+        assert!(!is_lock_password_wrap(vec![0_u8; 110]));
+    }
+
+    /// Changing the password checks the old one against the open vault's master key.
+    #[test]
+    fn rewrap_lock_password_checks_the_old_password() {
+        let master = MasterKey::generate().expect("randomness should be available");
+        let master_bytes = flow::master_key_to_bytes(&master).expose_secret().to_vec();
+        let vault = FfiVault::from_master_key(master_bytes.clone()).expect("the vault should open");
+        let old_wrap =
+            wrap_master_key_with_password(master_bytes.clone(), "old password".to_owned())
+                .expect("the old wrap should be written");
+
+        let new_wrap = vault
+            .rewrap_lock_password(
+                old_wrap.clone(),
+                "old password".to_owned(),
+                "new password".to_owned(),
+            )
+            .expect("the new wrap should be written");
+        assert_eq!(
+            unwrap_master_key_with_password(new_wrap, "new password".to_owned())
+                .expect("the new wrap should open"),
+            master_bytes
+        );
+
+        let error = vault
+            .rewrap_lock_password(
+                old_wrap.clone(),
+                "not the old password".to_owned(),
+                "new password".to_owned(),
+            )
+            .expect_err("a wrong old password must be rejected");
+        assert_eq!(error.kind(), "lock_password_rejected");
+
+        let other_master = MasterKey::generate().expect("randomness should be available");
+        let other_vault = FfiVault::from_master_key(
+            flow::master_key_to_bytes(&other_master)
+                .expose_secret()
+                .to_vec(),
+        )
+        .expect("the other vault should open");
+        let error = other_vault
+            .rewrap_lock_password(
+                old_wrap.clone(),
+                "old password".to_owned(),
+                "new password".to_owned(),
+            )
+            .expect_err("a wrap from another account must be rejected");
+        assert_eq!(error.kind(), "lock_password_rejected");
+
+        let error = vault
+            .rewrap_lock_password(old_wrap, "old password".to_owned(), String::new())
+            .expect_err("an empty new password must be rejected");
+        assert_eq!(error.kind(), "lock_passphrase_empty");
+    }
+
+    /// A backend with fixed answers, so the wrapper's mapping can be tested without a prompt.
+    #[derive(Debug)]
+    struct UnsupportedAuthStore;
+
+    impl bioauth::AuthBoundKeyStore for UnsupportedAuthStore {
+        fn availability(&self) -> bioauth::Availability {
+            bioauth::Availability::Unsupported {
+                reason: "test backend",
+            }
+        }
+
+        fn create(&self) -> bioauth::Result<()> {
+            Err(bioauth::Error::Unavailable {
+                reason: "test backend",
+            })
+        }
+
+        fn wrap(&self, _master: &bioauth::MasterKey) -> bioauth::Result<Vec<u8>> {
+            Err(bioauth::Error::Unavailable {
+                reason: "test backend",
+            })
+        }
+
+        fn unwrap(&self, _blob: &[u8]) -> bioauth::Result<bioauth::MasterKey> {
+            Err(bioauth::Error::Unavailable {
+                reason: "test backend",
+            })
+        }
+
+        fn delete_blob(&self, _blob: &[u8]) -> bioauth::Result<()> {
+            Ok(())
+        }
+
+        fn delete(&self) -> bioauth::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A host sealer whose answers are fixed, so the boundary can be exercised here.
+    #[derive(Debug)]
+    struct FakeHostSealer {
+        cancelled: std::sync::atomic::AtomicBool,
+    }
+
+    impl FfiPlatformSealer for FakeHostSealer {
+        fn backend(&self) -> String {
+            "android-keystore".to_owned()
+        }
+
+        fn availability(&self) -> FfiAuthAvailability {
+            FfiAuthAvailability::Available {
+                backend: "android-keystore".to_owned(),
+                hardware_backed: true,
+            }
+        }
+
+        fn seal(&self, plaintext: Vec<u8>) -> Result<Vec<u8>, FfiError> {
+            if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(FfiError::AuthBound {
+                    kind: "bioauth_authentication_failed".to_owned(),
+                    detail: "the prompt was dismissed".to_owned(),
+                });
+            }
+            Ok(plaintext.iter().map(|byte| byte ^ 0x5A).collect())
+        }
+
+        fn unseal(&self, envelope: Vec<u8>) -> Result<Vec<u8>, FfiError> {
+            if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(FfiError::AuthBound {
+                    kind: "bioauth_authentication_failed".to_owned(),
+                    detail: "the prompt was dismissed".to_owned(),
+                });
+            }
+            Ok(envelope.iter().map(|byte| byte ^ 0x5A).collect())
+        }
+
+        fn delete(&self) -> Result<(), FfiError> {
+            Ok(())
+        }
+    }
+
+    /// A host-supplied sealer seals and unseals through the same envelope.
+    #[test]
+    fn a_host_sealer_roundtrips() {
+        let host = Arc::new(FakeHostSealer {
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store = FfiAuthBoundKeyStore::with_host(host.clone(), "android-keystore".to_owned())
+            .expect("the backend name is known");
+        assert!(matches!(
+            store.availability(),
+            FfiAuthAvailability::Available { .. }
+        ));
+
+        let master = vec![5_u8; 32];
+        let blob = store.wrap(master.clone()).expect("seal");
+        assert_ne!(&blob[blob.len() - 32..], master.as_slice());
+        assert_eq!(store.unwrap(blob).expect("unseal"), master);
+
+        host.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = match store.wrap(master.clone()) {
+            Ok(_) => panic!("a cancelled gesture must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), "bioauth_authentication_failed");
+    }
+
+    /// A backend name this build does not know is rejected at construction.
+    #[test]
+    fn an_unknown_host_backend_is_rejected() {
+        let host = Arc::new(FakeHostSealer {
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        });
+        let built = FfiAuthBoundKeyStore::with_host(host, "not-a-backend".to_owned());
+        let error = match built {
+            Ok(_) => panic!("an unknown backend must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), "bioauth_unknown_backend");
+    }
+
+    /// The auth-bound wrapper keeps the library's error kinds and never falls back.
+    #[test]
+    fn auth_bound_errors_keep_their_kind() {
+        let store = FfiAuthBoundKeyStore::with_store(Box::new(UnsupportedAuthStore));
+        assert!(matches!(
+            store.availability(),
+            FfiAuthAvailability::Unsupported { .. }
+        ));
+
+        let error = store
+            .wrap(vec![0_u8; 31])
+            .expect_err("a 31-byte key must be rejected");
+        assert_eq!(error.kind(), "bioauth_master_key_wrong_length");
+
+        let error = store.create().expect_err("the test backend is unavailable");
+        assert_eq!(error.kind(), "bioauth_unavailable");
+
+        let vault = FfiVault::from_master_key(vec![9_u8; 32]).expect("the vault should open");
+        let error = vault
+            .wrap_master_for_auth_bound(store)
+            .expect_err("the test backend must not wrap");
+        assert_eq!(error.kind(), "bioauth_unavailable");
     }
 }
